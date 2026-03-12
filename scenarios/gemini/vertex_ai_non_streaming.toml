@@ -1,0 +1,49 @@
+[meta]
+name = "gemini_vertex_ai_non_streaming"
+protocol = "gemini"
+
+[request]
+method = "POST"
+path = "/v1/projects/my-project/locations/us-central1/publishers/google/models/gemini-2.5-flash:generateContent"
+host = "us-central1-aiplatform.googleapis.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"contents":[{"parts":[{"text":"hi"}]}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"candidates":[{"content":{"parts":[{"text":"Hello from Vertex!"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":8,"candidatesTokenCount":4,"totalTokenCount":12},"modelVersion":"gemini-2.5-flash-preview-05-20","responseId":"resp_vertex_1"}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 5_000_000_000
+response_first_byte_ns = 5_500_000_000
+response_complete_ns = 6_000_000_000
+
+[expected]
+id = "resp_vertex_1"
+model = "gemini-2.5-flash-preview-05-20"
+input_tokens = 8
+output_tokens = 4
+stop_reason = "stop"
+streaming = false
+kind = "llm_call"
+tools = []
+latency_ms = 500
+ttft_ms = 500

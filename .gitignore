@@ -1,0 +1,10 @@
+/target
+*.swp
+*.swo
+*~
+.DS_Store
+.env
+.env.*
+*_api_key.txt
+.vscode/
+.idea/

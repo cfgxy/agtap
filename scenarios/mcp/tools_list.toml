@@ -1,0 +1,38 @@
+[meta]
+name = "mcp_tools_list"
+protocol = "mcp"
+
+[request]
+method = "POST"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"jsonrpc":"2.0","id":2,"result":{"tools":[{"name":"read_file","description":"Read a file"},{"name":"write_file","description":"Write a file"}]}}
+'''
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_020_000_000
+response_complete_ns = 1_020_000_000
+
+[expected]
+kind = "mcp_call"
+model = "tools/list"
+tools = []
+stop_reason = "ok"
+streaming = false
+latency_ms = 20

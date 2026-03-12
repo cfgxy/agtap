@@ -1,0 +1,44 @@
+[meta]
+name = "anthropic_error_mismatched_cl"
+protocol = "anthropic"
+live = false
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+# Body is shorter than what Content-Length claims (999 bytes vs actual ~180)
+[response.body]
+raw = '''
+{"id":"msg_test_mismatch_cl","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Hello!"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+# Override content-length to a value larger than actual body
+override_content_length = 999
+
+[timing]
+request_start_ns = 12_000_000_000
+response_first_byte_ns = 12_000_100_000
+response_complete_ns = 12_000_200_000
+
+# No [expected] — response will never "complete" because Content-Length > actual body

@@ -1,0 +1,38 @@
+[meta]
+name = "mcp_error_response"
+protocol = "mcp"
+
+[request]
+method = "POST"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"bad_tool","arguments":{}}}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"jsonrpc":"2.0","id":3,"error":{"code":-32601,"message":"Method not found"}}
+'''
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_010_000_000
+response_complete_ns = 1_010_000_000
+
+[expected]
+kind = "mcp_call"
+model = "bad_tool"
+tools = ["bad_tool"]
+stop_reason = "error"
+streaming = false
+latency_ms = 10

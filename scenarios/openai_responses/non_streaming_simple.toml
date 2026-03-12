@@ -1,0 +1,49 @@
+[meta]
+name = "openai_responses_non_streaming_simple"
+protocol = "openai_responses"
+
+[request]
+method = "POST"
+path = "/v1/responses"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","input":"What is 2+2?"}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"id":"resp_test_ns","object":"response","model":"gpt-4o-2024-08-06","status":"completed","output":[{"type":"message","role":"assistant","content":[{"type":"output_text","text":"2 + 2 = 4."}]}],"usage":{"input_tokens":12,"output_tokens":8,"total_tokens":20}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_500_000_000
+response_complete_ns = 2_000_000_000
+
+[expected]
+id = "resp_test_ns"
+model = "gpt-4o-2024-08-06"
+input_tokens = 12
+output_tokens = 8
+stop_reason = "completed"
+streaming = false
+kind = "llm_call"
+tools = []
+latency_ms = 500
+ttft_ms = 500

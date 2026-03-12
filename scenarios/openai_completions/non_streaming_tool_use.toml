@@ -1,0 +1,49 @@
+[meta]
+name = "openai_non_streaming_tool_use"
+protocol = "openai_completions"
+
+[request]
+method = "POST"
+path = "/v1/chat/completions"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","messages":[{"role":"user","content":"What is the weather in NYC?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"id":"chatcmpl-test-tool-ns","object":"chat.completion","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":null,"tool_calls":[{"id":"call_xyz","type":"function","function":{"name":"get_weather","arguments":"{\"city\": \"NYC\"}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":45,"completion_tokens":18,"total_tokens":63}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 9_000_000_000
+response_first_byte_ns = 9_400_000_000
+response_complete_ns = 9_500_000_000
+
+[expected]
+id = "chatcmpl-test-tool-ns"
+model = "gpt-4o-2024-08-06"
+input_tokens = 45
+output_tokens = 18
+stop_reason = "tool_calls"
+streaming = false
+kind = "tool_use"
+tools = ["get_weather"]
+latency_ms = 400
+ttft_ms = 400

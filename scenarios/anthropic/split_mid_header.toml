@@ -1,0 +1,52 @@
+[meta]
+name = "anthropic_split_mid_header"
+protocol = "anthropic"
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"id":"msg_test_split_hdr","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[{"type":"text","text":"Hello!"}],"stop_reason":"end_turn","usage":{"input_tokens":10,"output_tokens":5}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 2
+# Split right after the HTTP status line, mid-headers
+response_split_points = [20]
+chunked = false
+
+[timing]
+request_start_ns = 8_000_000_000
+response_first_byte_ns = 8_500_000_000
+response_complete_ns = 9_000_000_000
+
+[expected]
+id = "msg_test_split_hdr"
+model = "claude-haiku-4-5-20251001"
+input_tokens = 10
+output_tokens = 5
+stop_reason = "end_turn"
+streaming = false
+kind = "llm_call"
+tools = []
+latency_ms = 1000
+ttft_ms = 500

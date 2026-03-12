@@ -1,0 +1,17 @@
+#!/bin/sh
+if ! command -v cargo > /dev/null 2>&1; then
+    echo "cargo not found on PATH — skipping fmt check"
+    exit 0
+fi
+
+cargo fmt --all -- --check || {
+    echo ""
+    echo "Formatting check failed. Run 'cargo fmt --all' and stage the changes."
+    exit 1
+}
+
+cargo test -p agtap --lib || {
+    echo ""
+    echo "Tests failed. Fix before committing."
+    exit 1
+}

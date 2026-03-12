@@ -1,0 +1,52 @@
+[meta]
+name = "gemini_streaming_simple"
+protocol = "gemini"
+
+[request]
+method = "POST"
+path = "/v1beta/models/gemini-2.5-flash:streamGenerateContent?alt=sse"
+host = "generativelanguage.googleapis.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"contents":[{"parts":[{"text":"hi"}]}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "text/event-stream"
+
+[response.body]
+raw = '''
+data: {"candidates":[{"content":{"parts":[{"text":"Hello"}],"role":"model"}}],"modelVersion":"gemini-2.5-flash-preview-05-20","responseId":"resp_test_stream_simple"}
+
+data: {"candidates":[{"content":{"parts":[{"text":" there!"}],"role":"model"},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":12,"candidatesTokenCount":8,"totalTokenCount":20},"modelVersion":"gemini-2.5-flash-preview-05-20","responseId":"resp_test_stream_simple"}
+
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = true
+
+[timing]
+request_start_ns = 3_000_000_000
+response_first_byte_ns = 3_400_000_000
+response_complete_ns = 3_500_000_000
+
+[expected]
+id = "resp_test_stream_simple"
+model = "gemini-2.5-flash-preview-05-20"
+input_tokens = 12
+output_tokens = 8
+stop_reason = "stop"
+streaming = true
+kind = "llm_call"
+tools = []
+latency_ms = 400
+ttft_ms = 400

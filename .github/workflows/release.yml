@@ -1,0 +1,97 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            archive_arch: x86_64
+          - runner: ubuntu-22.04-arm
+            archive_arch: aarch64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Validate tag matches Cargo.toml version
+        run: |
+          CARGO_VERSION=$(grep '^version' agtap/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "$CARGO_VERSION" != "${{ steps.version.outputs.VERSION }}" ]; then
+            echo "Tag ${{ github.ref_name }} does not match Cargo.toml version $CARGO_VERSION"
+            exit 1
+          fi
+
+      - name: Install Rust nightly
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rust-src
+
+      - name: Cache cargo registry and bpf-linker
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: release-${{ matrix.archive_arch }}-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: release-${{ matrix.archive_arch }}-cargo-
+
+      - name: Install bpf-linker
+        run: |
+          if ! command -v bpf-linker &> /dev/null; then
+            cargo install bpf-linker
+          fi
+
+      - name: Build release binary
+        run: cargo build -p agtap --release
+
+      - name: Verify binary version
+        run: |
+          VERSION=$(./target/release/agtap --version | awk '{print $2}')
+          if [ "$VERSION" != "${{ steps.version.outputs.VERSION }}" ]; then
+            echo "Binary version $VERSION does not match tag ${{ steps.version.outputs.VERSION }}"
+            exit 1
+          fi
+
+      - name: Package binary
+        run: |
+          ARCHIVE="agtap-v${{ steps.version.outputs.VERSION }}-linux-${{ matrix.archive_arch }}.tar.gz"
+          tar czf "$ARCHIVE" -C target/release agtap
+          sha256sum "$ARCHIVE" > "$ARCHIVE.sha256"
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.archive_arch }}
+          path: |
+            agtap-v*.tar.gz
+            agtap-v*.tar.gz.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            agtap-v*.tar.gz
+            agtap-v*.tar.gz.sha256
+          generate_release_notes: true

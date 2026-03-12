@@ -1,0 +1,46 @@
+[meta]
+name = "anthropic_error_429"
+protocol = "anthropic"
+live = false
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 429
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"type":"error","error":{"type":"rate_limit_error","message":"Rate limit exceeded"}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 9_000_000_000
+response_first_byte_ns = 9_000_100_000
+response_complete_ns = 9_000_200_000
+
+[expected]
+model = "claude-haiku-4-5-20251001"
+stop_reason = "error:rate_limit_error"
+streaming = false
+kind = "llm_call"
+tools = []

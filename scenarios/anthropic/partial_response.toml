@@ -1,0 +1,50 @@
+[meta]
+name = "anthropic_partial_response"
+protocol = "anthropic"
+live = false
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "text/event-stream"
+
+# Incomplete SSE stream — no message_stop event
+[response.body]
+raw = '''
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_test_partial","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[],"stop_reason":null,"usage":{"input_tokens":12,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 13_000_000_000
+response_first_byte_ns = 13_000_400_000
+response_complete_ns = 13_001_000_000
+
+# No [expected] — incomplete streaming response never completes (no message_stop)

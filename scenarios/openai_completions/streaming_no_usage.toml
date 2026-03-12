@@ -1,0 +1,54 @@
+[meta]
+name = "openai_streaming_no_usage"
+protocol = "openai_completions"
+
+[request]
+method = "POST"
+path = "/v1/chat/completions"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "text/event-stream"
+
+[response.body]
+raw = '''
+data: {"id":"chatcmpl-test-no-usage","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-no-usage","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{"content":"Hi!"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-no-usage","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}
+
+data: [DONE]
+
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 7_000_000_000
+response_first_byte_ns = 7_200_000_000
+response_complete_ns = 7_300_000_000
+
+[expected]
+id = "chatcmpl-test-no-usage"
+model = "gpt-4o-2024-08-06"
+stop_reason = "stop"
+streaming = true
+kind = "llm_call"
+tools = []
+latency_ms = 200
+ttft_ms = 200

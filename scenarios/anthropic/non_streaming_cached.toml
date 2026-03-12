@@ -1,0 +1,52 @@
+[meta]
+name = "anthropic_non_streaming_cached"
+protocol = "anthropic"
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-sonnet-4-20250514","max_tokens":100,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"id":"msg_test_ns_cached","type":"message","role":"assistant","model":"claude-sonnet-4-20250514","content":[{"type":"text","text":"Hello there!"}],"stop_reason":"end_turn","usage":{"input_tokens":15,"output_tokens":8,"cache_creation_input_tokens":500,"cache_read_input_tokens":200}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 2_000_000_000
+response_first_byte_ns = 2_800_000_000
+response_complete_ns = 3_000_000_000
+
+[expected]
+id = "msg_test_ns_cached"
+model = "claude-sonnet-4-20250514"
+input_tokens = 715
+output_tokens = 8
+cache_creation_input_tokens = 500
+cache_read_input_tokens = 200
+stop_reason = "end_turn"
+streaming = false
+kind = "llm_call"
+tools = []
+latency_ms = 800
+ttft_ms = 800

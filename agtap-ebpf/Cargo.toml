@@ -1,0 +1,16 @@
+[package]
+name = "agtap-ebpf"
+version = "0.1.0"
+edition = "2021"
+description.workspace = true
+authors.workspace = true
+repository.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "agtap-probes"
+path = "src/main.rs"
+
+[dependencies]
+agtap-common = { path = "../agtap-common", default-features = false }
+aya-ebpf = "0.1"

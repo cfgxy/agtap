@@ -1,0 +1,60 @@
+[meta]
+name = "openai_streaming_tool_use"
+protocol = "openai_completions"
+
+[request]
+method = "POST"
+path = "/v1/chat/completions"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","stream":true,"stream_options":{"include_usage":true},"messages":[{"role":"user","content":"What is the weather in NYC?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"}}}}}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "text/event-stream"
+
+[response.body]
+raw = '''
+data: {"id":"chatcmpl-test-tool-stream","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-tool-stream","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-tool-stream","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":": \"NYC\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-test-tool-stream","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: {"id":"chatcmpl-test-tool-stream","object":"chat.completion.chunk","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[],"usage":{"prompt_tokens":50,"completion_tokens":20,"total_tokens":70}}
+
+data: [DONE]
+
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 5_000_000_000
+response_first_byte_ns = 5_300_000_000
+response_complete_ns = 5_500_000_000
+
+[expected]
+id = "chatcmpl-test-tool-stream"
+model = "gpt-4o-2024-08-06"
+input_tokens = 50
+output_tokens = 20
+stop_reason = "tool_calls"
+streaming = true
+kind = "tool_use"
+tools = ["get_weather"]
+latency_ms = 300
+ttft_ms = 300

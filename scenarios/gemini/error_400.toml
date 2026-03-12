@@ -1,0 +1,45 @@
+[meta]
+name = "gemini_error_400"
+protocol = "gemini"
+live = false
+
+[request]
+method = "POST"
+path = "/v1beta/models/gemini-2.5-flash:generateContent"
+host = "generativelanguage.googleapis.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"contents":[{"parts":[{"text":"hi"}]}]}
+'''
+
+[response]
+status = 400
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"error":{"code":400,"status":"INVALID_ARGUMENT","message":"API key not valid. Please pass a valid API key."}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 9_000_000_000
+response_first_byte_ns = 9_000_100_000
+response_complete_ns = 9_000_200_000
+
+[expected]
+model = "gemini-2.5-flash"
+stop_reason = "error:INVALID_ARGUMENT"
+streaming = false
+kind = "llm_call"
+tools = []

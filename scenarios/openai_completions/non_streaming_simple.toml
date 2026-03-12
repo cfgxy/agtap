@@ -1,0 +1,49 @@
+[meta]
+name = "openai_non_streaming_simple"
+protocol = "openai_completions"
+
+[request]
+method = "POST"
+path = "/v1/chat/completions"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"id":"chatcmpl-test-ns","object":"chat.completion","created":1700000000,"model":"gpt-4o-2024-08-06","choices":[{"index":0,"message":{"role":"assistant","content":"Hello! How can I help you today?"},"finish_reason":"stop"}],"usage":{"prompt_tokens":8,"completion_tokens":9,"total_tokens":17}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_500_000_000
+response_complete_ns = 2_000_000_000
+
+[expected]
+id = "chatcmpl-test-ns"
+model = "gpt-4o-2024-08-06"
+input_tokens = 8
+output_tokens = 9
+stop_reason = "stop"
+streaming = false
+kind = "llm_call"
+tools = []
+latency_ms = 500
+ttft_ms = 500

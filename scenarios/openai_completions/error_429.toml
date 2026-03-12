@@ -1,0 +1,44 @@
+[meta]
+name = "openai_error_429"
+protocol = "openai_completions"
+
+[request]
+method = "POST"
+path = "/v1/chat/completions"
+host = "api.openai.com"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 429
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"error":{"message":"Rate limit exceeded","type":"rate_limit_error","code":"rate_limit_exceeded"}}
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 11_000_000_000
+response_first_byte_ns = 11_100_000_000
+response_complete_ns = 11_100_000_000
+
+[expected]
+model = "gpt-4o"
+stop_reason = "error:rate_limit_error"
+streaming = false
+kind = "llm_call"
+tools = []

@@ -1,0 +1,41 @@
+[meta]
+name = "anthropic_error_malformed_body"
+protocol = "anthropic"
+live = false
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{this is not valid json at all!!!
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 11_000_000_000
+response_first_byte_ns = 11_000_100_000
+response_complete_ns = 11_000_200_000
+
+# No [expected] — parse_exchange should return None for malformed body

@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = [
+    "agtap",
+    "agtap-common",
+    "agtap-ebpf",
+    "agtap-mock",
+    "agtap-test",
+]
+default-members = [
+    "agtap",
+    "agtap-common",
+    "agtap-mock",
+]
+
+[workspace.package]
+description = "eBPF-based LLM and MCP call profiler"
+authors = ["Alex Zhebrak"]
+repository = "https://github.com/zhebrak/agtap"
+license = "MIT"
+
+[profile.release]
+lto = true
+strip = true

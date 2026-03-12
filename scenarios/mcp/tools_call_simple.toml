@@ -1,0 +1,38 @@
+[meta]
+name = "mcp_tools_call"
+protocol = "mcp"
+
+[request]
+method = "POST"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"read_file","arguments":{"path":"/tmp/test.txt"}}}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"jsonrpc":"2.0","id":1,"result":{"content":[{"type":"text","text":"file contents here"}]}}
+'''
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_045_000_000
+response_complete_ns = 1_045_000_000
+
+[expected]
+kind = "mcp_call"
+model = "read_file"
+tools = ["read_file"]
+stop_reason = "ok"
+streaming = false
+latency_ms = 45

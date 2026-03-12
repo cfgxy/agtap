@@ -1,0 +1,38 @@
+[meta]
+name = "mcp_resources_read"
+protocol = "mcp"
+
+[request]
+method = "POST"
+
+[request.headers]
+content-type = "application/json"
+
+[request.body]
+raw = '''
+{"jsonrpc":"2.0","id":4,"method":"resources/read","params":{"uri":"file:///tmp/test.txt"}}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "application/json"
+
+[response.body]
+raw = '''
+{"jsonrpc":"2.0","id":4,"result":{"contents":[{"uri":"file:///tmp/test.txt","mimeType":"text/plain","text":"hello world"}]}}
+'''
+
+[timing]
+request_start_ns = 1_000_000_000
+response_first_byte_ns = 1_030_000_000
+response_complete_ns = 1_030_000_000
+
+[expected]
+kind = "mcp_call"
+model = "resources/read"
+tools = []
+stop_reason = "ok"
+streaming = false
+latency_ms = 30

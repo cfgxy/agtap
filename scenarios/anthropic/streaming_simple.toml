@@ -1,0 +1,70 @@
+[meta]
+name = "anthropic_streaming_simple"
+protocol = "anthropic"
+
+[request]
+method = "POST"
+path = "/v1/messages"
+host = "api.anthropic.com"
+
+[request.headers]
+content-type = "application/json"
+anthropic-version = "2023-06-01"
+
+[request.body]
+raw = '''
+{"model":"claude-haiku-4-5-20251001","max_tokens":50,"stream":true,"messages":[{"role":"user","content":"hi"}]}
+'''
+
+[response]
+status = 200
+
+[response.headers]
+content-type = "text/event-stream"
+
+[response.body]
+raw = '''
+event: message_start
+data: {"type":"message_start","message":{"id":"msg_test_stream_simple","type":"message","role":"assistant","model":"claude-haiku-4-5-20251001","content":[],"stop_reason":null,"usage":{"input_tokens":12,"output_tokens":0}}}
+
+event: content_block_start
+data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Hello"}}
+
+event: content_block_delta
+data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":" there!"}}
+
+event: content_block_stop
+data: {"type":"content_block_stop","index":0}
+
+event: message_delta
+data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":8}}
+
+event: message_stop
+data: {"type":"message_stop"}
+
+'''
+
+[transport]
+request_fragments = 1
+response_fragments = 1
+chunked = false
+
+[timing]
+request_start_ns = 3_000_000_000
+response_first_byte_ns = 3_400_000_000
+response_complete_ns = 3_500_000_000
+
+[expected]
+id = "msg_test_stream_simple"
+model = "claude-haiku-4-5-20251001"
+input_tokens = 12
+output_tokens = 8
+stop_reason = "end_turn"
+streaming = true
+kind = "llm_call"
+tools = []
+latency_ms = 400
+ttft_ms = 400
