@@ -1,6 +1,6 @@
 # agtap
 
-eBPF-based LLM API and MCP call profiler for Linux. Captures Anthropic, OpenAI, Google Gemini, and MCP traffic with zero application changes. Uses eBPF to intercept TLS and syscalls — zero instrumentation required. OTel and Prometheus metrics out of the box.
+eBPF-based LLM API and MCP call tracer for Linux. Captures Anthropic, OpenAI, Google Gemini, and MCP traffic with zero application changes. Uses eBPF to intercept TLS via OpenSSL uprobes and I/O via kernel probes. OTel and Prometheus metrics out of the box.
 
 ![agtap TUI screenshot](assets/agtap.png)
 
