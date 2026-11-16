@@ -183,4 +183,47 @@ mod tests {
         store.cleanup_if_needed(&HashSet::new());
         assert!(!body_path.exists());
     }
+
+    #[test]
+    fn cleanup_protects_body_during_unqueued_rotation_recovery() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let body_path = body_dir.join("body.json");
+        fs::write(&body_path, br#"{"request_body":"hello"}"#).unwrap();
+        let log = dir.path().join("events.jsonl");
+        fs::write(
+            &log,
+            format!(r#"{{"id":"e1","body_path":"{}"}}"#, body_path.display()) + "\n",
+        )
+        .unwrap();
+
+        let source_len = fs::metadata(&log).unwrap().len();
+        queue.begin_rotation(&log, source_len).unwrap();
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        let protected_before_enqueue = queue.protected_body_paths(None);
+        assert!(protected_before_enqueue.contains(&body_path));
+        store.cleanup_if_needed(&protected_before_enqueue);
+        assert!(
+            body_path.exists(),
+            "intent must protect body before job creation"
+        );
+
+        let rotated = dir.path().join("events.jsonl.1");
+        fs::rename(&log, &rotated).unwrap();
+        queue.recover_rotations(&log, "tests").unwrap();
+        assert_eq!(queue.pending_count(), 1);
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        let protected_after_recovery = queue.protected_body_paths(None);
+        assert!(protected_after_recovery.contains(&body_path));
+        store.cleanup_if_needed(&protected_after_recovery);
+        assert!(
+            body_path.exists(),
+            "recovered job must keep body available for packaging"
+        );
+    }
 }

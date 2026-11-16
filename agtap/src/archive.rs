@@ -360,8 +360,9 @@ impl ArchiveQueue {
         let _ = fs::remove_file(self.pending_dir.join(format!("{}.json", job.id)));
     }
 
-    /// Return body files referenced by all queued or in-flight jobs. The current job is kept in
-    /// the set until its queue record is removed, so normal cleanup cannot race an upload.
+    /// Return body files referenced by queued jobs and unfinished rotation intents. The current
+    /// job and intent remain protected until their queue records are removed, so normal cleanup
+    /// cannot race rotation recovery or an upload.
     pub fn protected_body_paths(&self, exclude_job: Option<&str>) -> HashSet<PathBuf> {
         let mut protected = HashSet::new();
         for job in self.load_jobs() {
@@ -374,6 +375,35 @@ impl ArchiveQueue {
             }
             if let Ok(paths) = body_paths_from_log(Path::new(&job.source_path)) {
                 protected.extend(paths.into_iter().map(PathBuf::from));
+            }
+        }
+
+        let Ok(entries) = fs::read_dir(&self.pending_dir) else {
+            return protected;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            if !name.starts_with(".rotation-")
+                || path.extension().and_then(|ext| ext.to_str()) != Some("json")
+            {
+                continue;
+            }
+            let Ok(bytes) = fs::read(&path) else {
+                continue;
+            };
+            let Ok(intent) = serde_json::from_slice::<RotationIntent>(&bytes) else {
+                continue;
+            };
+
+            // The snapshot is the immutable source for recovery. If snapshot creation itself
+            // failed after the intent was persisted, protect the still-active log as well.
+            for source in [&intent.snapshot_path, &intent.log_path] {
+                if let Ok(paths) = body_paths_from_log(Path::new(source)) {
+                    protected.extend(paths.into_iter().map(PathBuf::from));
+                }
             }
         }
         protected
