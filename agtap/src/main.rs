@@ -630,7 +630,7 @@ async fn main() -> anyhow::Result<()> {
     let max_log_bytes = cli.max_log_size * 1024 * 1024;
     let mut log_writer = event_log::LogWriter::open(&log_path, max_log_bytes, cli.max_log_files)?;
     if let Some(queue) = archive_queue.clone() {
-        log_writer.set_archive_queue(queue, cli.archive_s3_prefix.clone());
+        log_writer.set_archive_queue(queue, cli.archive_s3_prefix.clone())?;
     }
     eprintln!("agtap: logging to {}", log_path.display());
 
