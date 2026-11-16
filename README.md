@@ -99,8 +99,14 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 | `--metrics-addr <ADDR>` | Expose Prometheus metrics (e.g., `127.0.0.1:9464`) |
 | `--max-body-store <MB>` | Max body storage on disk (default: 500 MB) |
 | `--body-retention <HOURS>` | Body file retention period (default: 24h) |
+| `--max-body-retain-kb <KB>` | Max request/response body retained per detail file (default: 512 KiB, hard cap: 64 MiB) |
 | `--max-log-size <MB>` | Max event log size before rotation (default: 50) |
 | `--max-log-files <N>` | Max rotated log files to keep (default: 3) |
+| `--archive-s3-endpoint <URL>` | S3-compatible endpoint, such as MinIO; omit for AWS S3 |
+| `--archive-s3-bucket <BUCKET>` | Enable asynchronous archive uploads to this bucket |
+| `--archive-s3-prefix <PREFIX>` | Object key prefix (default: `agtap`) |
+| `--archive-s3-region <REGION>` | S3 signing region (default: `us-east-1`) |
+| `--archive-retry-delay-secs <SECONDS>` | Base delay for failed archive retries (default: 5) |
 
 ### Environment variables
 
@@ -108,11 +114,14 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 |----------|-------------|
 | `AGTAP_LOG` | Override default event log path (default: `/tmp/agtap/events.jsonl`) |
 | `AGTAP_SOCK` | Override default Unix socket path (default: `/tmp/agtap/agtap.sock`) |
+| `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` | Credentials loaded by the AWS SDK; never put them in arguments or files committed to the repository |
+| `AWS_SESSION_TOKEN` | Optional session credential loaded by the AWS SDK |
 
 ## Output
 
 - **JSONL** — to stdout and `/tmp/agtap/events.jsonl`
 - **Bodies** — full request/response payloads in `/tmp/agtap/bodies/`
+- **S3 archive** — rotated event JSONL and referenced body JSON are packaged and uploaded asynchronously; pending jobs live under `/tmp/agtap/archive/`
 - **TUI** — live terminal dashboard via Unix socket
 - **OpenTelemetry** — OTLP/HTTP export
 - **Prometheus** — `/metrics` endpoint

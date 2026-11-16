@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::providers::HttpDetail;
 
@@ -88,7 +89,7 @@ impl BodyStore {
     }
 
     /// Delete old files and enforce size limit. Called periodically (every 10 min).
-    pub fn cleanup_if_needed(&mut self) {
+    pub fn cleanup_if_needed(&mut self, protected_paths: &HashSet<PathBuf>) {
         if self.last_cleanup.elapsed().as_secs() < CLEANUP_INTERVAL_SECS {
             return;
         }
@@ -120,6 +121,9 @@ impl BodyStore {
 
         // Pass 1: delete files older than retention
         files.retain(|&(ref path, size, modified)| {
+            if protected_paths.contains(path) {
+                return true;
+            }
             let age = now.duration_since(modified).unwrap_or_default();
             if age.as_secs() > self.retention_secs {
                 if fs::remove_file(path).is_ok() {
@@ -139,10 +143,44 @@ impl BodyStore {
                 if self.total_bytes <= target {
                     break;
                 }
+                if protected_paths.contains(path) {
+                    continue;
+                }
                 if fs::remove_file(path).is_ok() {
                     self.total_bytes = self.total_bytes.saturating_sub(*size);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    #[test]
+    fn cleanup_does_not_remove_protected_body() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BodyStore::open(dir.path(), 0, 24).unwrap();
+        let detail = crate::providers::test_helpers::make_exchange(
+            "example.test",
+            "/v1/test",
+            b"request",
+            b"response",
+        );
+        let http_detail = crate::providers::build_http_detail(&detail, &detail.response.body);
+        let body_path = store.write(1, 1, "event", &http_detail).unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        let mut protected = HashSet::new();
+        protected.insert(body_path.clone());
+        store.cleanup_if_needed(&protected);
+        assert!(body_path.exists());
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        store.cleanup_if_needed(&HashSet::new());
+        assert!(!body_path.exists());
     }
 }

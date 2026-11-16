@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::archive::ArchiveQueue;
 use crate::output::AgentEvent;
 
 pub struct LogWriter {
@@ -11,6 +13,8 @@ pub struct LogWriter {
     max_bytes: u64,
     max_files: usize,
     rotation_failed: bool,
+    archive_queue: Option<Arc<ArchiveQueue>>,
+    archive_prefix: String,
 }
 
 fn open_log_file(path: &Path) -> anyhow::Result<File> {
@@ -48,7 +52,14 @@ impl LogWriter {
             max_bytes,
             max_files: max_files.max(1),
             rotation_failed: false,
+            archive_queue: None,
+            archive_prefix: "agtap".to_string(),
         })
+    }
+
+    pub fn set_archive_queue(&mut self, queue: Arc<ArchiveQueue>, prefix: String) {
+        self.archive_queue = Some(queue);
+        self.archive_prefix = prefix;
     }
 
     pub fn write_event(&mut self, event: &AgentEvent) {
@@ -93,6 +104,12 @@ impl LogWriter {
         let file = open_log_file(&self.log_path)?;
         self.writer = BufWriter::new(file);
         self.bytes_written = 0;
+
+        if let Some(queue) = &self.archive_queue {
+            queue
+                .enqueue_rotated(&first_rotated, &self.archive_prefix)
+                .map_err(|err| anyhow::anyhow!("persist archive job: {err}"))?;
+        }
         Ok(())
     }
 }
@@ -259,6 +276,30 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let writer = LogWriter::open(&log_path, 100, 0).unwrap();
         assert_eq!(writer.max_files, 1);
+    }
+
+    #[test]
+    fn test_archive_snapshot_survives_rotated_rename() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let queue = Arc::new(ArchiveQueue::open(dir.path()).unwrap());
+        let mut writer = LogWriter::open(&log_path, 50, 2).unwrap();
+        writer.set_archive_queue(queue.clone(), "tests".to_string());
+
+        for _ in 0..30 {
+            writer.write_event(&make_event());
+        }
+
+        assert!(dir.path().join("events.jsonl.1").exists());
+        assert!(dir.path().join("events.jsonl.2").exists());
+        assert!(queue.pending_count() >= 2);
+        assert!(dir
+            .path()
+            .join("archive/closed")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
     }
 
     #[test]
