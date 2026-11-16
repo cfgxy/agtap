@@ -27,6 +27,8 @@ pub struct ArchiveConfig {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ArchiveJob {
     id: String,
+    #[serde(default)]
+    rotation_id: Option<String>,
     source_path: String,
     #[serde(default)]
     rotated_path: Option<String>,
@@ -43,7 +45,10 @@ struct RotationIntent {
     id: String,
     log_path: String,
     rotated_path: String,
+    snapshot_path: String,
     source_len: u64,
+    source_identity: Option<String>,
+    source_sha256: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -117,7 +122,7 @@ impl ArchiveQueue {
             })?;
         }
 
-        if let Err(err) = self.enqueue_snapshot(&snapshot, object_prefix, rotated_source) {
+        if let Err(err) = self.enqueue_snapshot(&snapshot, object_prefix, None, rotated_source) {
             let _ = fs::remove_file(&snapshot);
             return Err(err);
         }
@@ -128,12 +133,14 @@ impl ArchiveQueue {
         &self,
         snapshot: &Path,
         object_prefix: &str,
+        rotation_id: Option<&str>,
         rotated_source: Option<&Path>,
     ) -> io::Result<()> {
         let id = unique_id();
         let object_key = format!("{}/{}.json", object_prefix.trim_matches('/'), id);
         let job = ArchiveJob {
             id: id.clone(),
+            rotation_id: rotation_id.map(str::to_owned),
             source_path: snapshot.to_string_lossy().into_owned(),
             rotated_path: rotated_source.map(|path| path.to_string_lossy().into_owned()),
             payload_path: None,
@@ -146,13 +153,41 @@ impl ArchiveQueue {
         self.save_job(&job)
     }
 
+    pub(crate) fn enqueue_rotation(
+        &self,
+        rotation_id: &str,
+        object_prefix: &str,
+        rotated_source: &Path,
+    ) -> io::Result<()> {
+        let snapshot = self
+            .closed_dir
+            .join(format!("rotation-{rotation_id}.jsonl"));
+        if !snapshot.is_file() {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("rotation snapshot missing: {}", snapshot.display()),
+            ));
+        }
+        self.enqueue_snapshot(
+            &snapshot,
+            object_prefix,
+            Some(rotation_id),
+            Some(rotated_source),
+        )
+    }
+
     pub fn begin_rotation(&self, log_path: &Path, source_len: u64) -> io::Result<String> {
         let id = unique_id();
+        let snapshot_path = self.closed_dir.join(format!("rotation-{id}.jsonl"));
+        let source_bytes = fs::read(log_path)?;
         let intent = RotationIntent {
             id: id.clone(),
             log_path: log_path.to_string_lossy().into_owned(),
             rotated_path: rotated_log_path(log_path, 1).to_string_lossy().into_owned(),
+            snapshot_path: snapshot_path.to_string_lossy().into_owned(),
             source_len,
+            source_identity: file_identity(log_path).ok(),
+            source_sha256: sha256_hex(&source_bytes),
         };
         let path = self.pending_dir.join(format!(".rotation-{id}.json"));
         let temp = self.pending_dir.join(format!(".rotation-{id}.json.tmp"));
@@ -160,6 +195,16 @@ impl ArchiveQueue {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
         fs::write(&temp, bytes)?;
         fs::rename(temp, path)?;
+        if let Err(link_err) = fs::hard_link(log_path, &snapshot_path) {
+            fs::copy(log_path, &snapshot_path).map_err(|copy_err| {
+                io::Error::new(
+                    copy_err.kind(),
+                    format!(
+                        "rotation snapshot failed after hard-link error: {link_err}; {copy_err}"
+                    ),
+                )
+            })?;
+        }
         Ok(id)
     }
 
@@ -201,60 +246,51 @@ impl ArchiveQueue {
             .iter()
             .map(|job| job.source_path.clone())
             .collect::<HashSet<_>>();
-        let mut orphan_snapshots = snapshots
+        let intent_snapshots = intents
+            .iter()
+            .map(|intent| intent.snapshot_path.clone())
+            .collect::<HashSet<_>>();
+        let orphan_snapshots = snapshots
             .flatten()
             .map(|entry| entry.path())
             .filter(|snapshot| {
                 snapshot.extension().and_then(|ext| ext.to_str()) == Some("jsonl")
                     && !referenced_snapshots.contains(&snapshot.to_string_lossy().into_owned())
+                    && !intent_snapshots.contains(&snapshot.to_string_lossy().into_owned())
             })
             .collect::<Vec<_>>();
 
         for intent in intents {
-            let already_enqueued = jobs
-                .iter()
-                .any(|job| job.rotated_path.as_deref() == Some(intent.rotated_path.as_str()));
+            let already_enqueued = jobs.iter().any(|job| {
+                job.rotation_id.as_deref() == Some(intent.id.as_str())
+                    || job.source_path == intent.snapshot_path
+            });
             if already_enqueued {
                 self.complete_rotation(&intent.id)?;
                 continue;
             }
 
-            let current_len = fs::metadata(log_path).map(|meta| meta.len());
-            let rotated_exists = Path::new(&intent.rotated_path).is_file();
-            let rotation_completed = current_len.is_err()
-                || current_len
-                    .map(|len| len < intent.source_len)
-                    .unwrap_or(false);
-            if rotation_completed && rotated_exists {
-                let orphan_index = orphan_snapshots.iter().position(|snapshot| {
-                    fs::metadata(snapshot)
-                        .map(|metadata| metadata.len() == intent.source_len)
-                        .unwrap_or(false)
-                });
-                if let Some(index) = orphan_index {
-                    let snapshot = orphan_snapshots.swap_remove(index);
-                    self.enqueue_snapshot(
-                        &snapshot,
-                        object_prefix,
-                        Some(Path::new(&intent.rotated_path)),
-                    )?;
-                } else {
-                    self.enqueue_rotated_with_source(
-                        Path::new(&intent.rotated_path),
-                        object_prefix,
-                        Some(Path::new(&intent.rotated_path)),
-                    )?;
-                }
-                jobs = self.load_jobs();
+            if !rotation_completed(log_path, &intent) {
+                let _ = fs::remove_file(&intent.snapshot_path);
                 self.complete_rotation(&intent.id)?;
-            } else if !rotation_completed {
+                continue;
+            }
+
+            if Path::new(&intent.snapshot_path).is_file() {
+                self.enqueue_snapshot(
+                    Path::new(&intent.snapshot_path),
+                    object_prefix,
+                    Some(&intent.id),
+                    Some(Path::new(&intent.rotated_path)),
+                )?;
+                jobs = self.load_jobs();
                 self.complete_rotation(&intent.id)?;
             }
         }
 
         for snapshot in orphan_snapshots {
             if snapshot.is_file() {
-                self.enqueue_snapshot(&snapshot, object_prefix, None)?;
+                self.enqueue_snapshot(&snapshot, object_prefix, None, None)?;
             }
         }
         Ok(())
@@ -577,6 +613,36 @@ fn rotated_log_path(base: &Path, n: usize) -> PathBuf {
     base.with_file_name(name)
 }
 
+fn rotation_completed(log_path: &Path, intent: &RotationIntent) -> bool {
+    let Ok(_) = fs::metadata(log_path) else {
+        return true;
+    };
+
+    if let (Some(expected), Ok(actual)) =
+        (intent.source_identity.as_deref(), file_identity(log_path))
+    {
+        return expected != actual;
+    }
+
+    fs::read(log_path)
+        .map(|bytes| sha256_hex(&bytes) != intent.source_sha256)
+        .unwrap_or(true)
+}
+
+#[cfg(unix)]
+fn file_identity(path: &Path) -> io::Result<String> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::metadata(path)?;
+    Ok(format!("{}:{}", metadata.dev(), metadata.ino()))
+}
+
+#[cfg(not(unix))]
+fn file_identity(path: &Path) -> io::Result<String> {
+    let metadata = fs::metadata(path)?;
+    Ok(format!("{}:{:?}", metadata.len(), metadata.modified()?))
+}
+
 fn unix_secs() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -738,28 +804,83 @@ mod tests {
     }
 
     #[test]
-    fn orphan_snapshot_is_bound_to_rotation_intent_without_duplicate() {
+    fn rotation_recovery_uses_intent_snapshot_not_same_length_orphan() {
         let dir = TempDir::new().unwrap();
         let runtime = dir.path().join("runtime");
         let queue = ArchiveQueue::open(&runtime).unwrap();
         let log = dir.path().join("events.jsonl");
         let rotated = dir.path().join("events.jsonl.1");
-        let contents = "{\"id\":\"e1\"}\n";
-        fs::write(&log, contents).unwrap();
+        let current_contents = "{\"id\":\"new\"}\n";
+        let stale_contents = "{\"id\":\"old\"}\n";
+        assert_eq!(current_contents.len(), stale_contents.len());
+        fs::write(&log, current_contents).unwrap();
         let source_len = fs::metadata(&log).unwrap().len();
-        queue.begin_rotation(&log, source_len).unwrap();
+        let rotation_id = queue.begin_rotation(&log, source_len).unwrap();
+        let stable_snapshot = queue
+            .closed_dir
+            .join(format!("rotation-{rotation_id}.jsonl"));
         fs::rename(&log, &rotated).unwrap();
         let orphan = queue.closed_dir.join("orphan.jsonl");
-        fs::write(&orphan, contents).unwrap();
+        fs::write(&orphan, stale_contents).unwrap();
 
         queue.recover_rotations(&log, "tests").unwrap();
 
         let jobs = queue.load_jobs();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].source_path, orphan.to_string_lossy());
+        let rotation_job = jobs
+            .iter()
+            .find(|job| job.rotation_id.as_deref() == Some(rotation_id.as_str()))
+            .unwrap();
+        assert_eq!(jobs.len(), 2);
+        assert_eq!(rotation_job.source_path, stable_snapshot.to_string_lossy());
         assert_eq!(
-            jobs[0].rotated_path.as_deref(),
+            fs::read_to_string(&rotation_job.source_path).unwrap(),
+            current_contents
+        );
+        assert_eq!(
+            rotation_job.rotated_path.as_deref(),
             Some(rotated.to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn rotation_recovery_keeps_distinct_intents_after_rotated_path_reuse() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let log = dir.path().join("events.jsonl");
+        let first_rotated = dir.path().join("events.jsonl.1");
+        let second_rotated = dir.path().join("events.jsonl.2");
+
+        fs::write(&log, "{\"id\":\"first\"}\n").unwrap();
+        let first_len = fs::metadata(&log).unwrap().len();
+        let first_id = queue.begin_rotation(&log, first_len).unwrap();
+        fs::rename(&log, &first_rotated).unwrap();
+        queue
+            .enqueue_rotation(&first_id, "tests", &first_rotated)
+            .unwrap();
+
+        fs::rename(&first_rotated, &second_rotated).unwrap();
+        fs::write(&log, "{\"id\":\"second\"}\n").unwrap();
+        let second_len = fs::metadata(&log).unwrap().len();
+        let second_id = queue.begin_rotation(&log, second_len).unwrap();
+        let second_snapshot = queue.closed_dir.join(format!("rotation-{second_id}.jsonl"));
+        fs::rename(&log, &first_rotated).unwrap();
+
+        queue.recover_rotations(&log, "tests").unwrap();
+
+        let jobs = queue.load_jobs();
+        assert_eq!(jobs.len(), 2);
+        assert!(jobs
+            .iter()
+            .any(|job| job.rotation_id.as_deref() == Some(first_id.as_str())));
+        let second_job = jobs
+            .iter()
+            .find(|job| job.rotation_id.as_deref() == Some(second_id.as_str()))
+            .unwrap();
+        assert_eq!(second_job.source_path, second_snapshot.to_string_lossy());
+        assert_eq!(
+            fs::read_to_string(&second_job.source_path).unwrap(),
+            "{\"id\":\"second\"}\n"
         );
     }
 

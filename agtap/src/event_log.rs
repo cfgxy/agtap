@@ -129,14 +129,10 @@ impl LogWriter {
         self.bytes_written = 0;
 
         if let Some(queue) = &self.archive_queue {
-            queue
-                .enqueue_rotated_with_source(
-                    &first_rotated,
-                    &self.archive_prefix,
-                    Some(&first_rotated),
-                )
-                .map_err(|err| anyhow::anyhow!("persist archive job: {err}"))?;
             if let Some(rotation_id) = rotation_id {
+                queue
+                    .enqueue_rotation(&rotation_id, &self.archive_prefix, &first_rotated)
+                    .map_err(|err| anyhow::anyhow!("persist archive job: {err}"))?;
                 queue.complete_rotation(&rotation_id)?;
             }
         }
