@@ -248,7 +248,7 @@ async fn drain_ring_events(
 
         let is_pipe = StdioReassembler::is_pipe_event(event.direction);
         let is_tcp = (event.direction & TCP_FLAG) != 0;
-        let actual_dir = event.direction & 1;
+        let actual_dir = reassembly::actual_direction(event.direction);
 
         if verbose {
             let source = if is_pipe {
@@ -333,7 +333,7 @@ async fn drain_ring_events(
             if let Some((api_kind, exchange)) = reassembler.process_event(
                 event.pid,
                 conn_id,
-                event.direction,
+                actual_dir,
                 actual_data,
                 event.timestamp_ns,
                 &comm,

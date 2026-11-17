@@ -90,6 +90,12 @@ pub struct Reassembler {
     streams: HashMap<(u32, u64), ConnState>,
 }
 
+/// Reduce capture direction values to the request/response bit consumed by the reassembler.
+/// TCP events carry `TCP_FLAG` in the upper bits; SSL events already use the same low bit.
+pub fn actual_direction(direction: u32) -> u32 {
+    direction & 1
+}
+
 impl Reassembler {
     pub fn new() -> Self {
         Self::default()
@@ -658,6 +664,39 @@ data: {\"type\":\"message_stop\"}\n\
         assert!(!exchange.response.is_streaming);
         assert_eq!(exchange.request.timestamp_ns, 1000);
         assert_eq!(exchange.response.first_byte_ns, Some(2000));
+    }
+
+    #[test]
+    fn test_tcp_flag_direction_is_normalized_at_reassembly_boundary() {
+        let mut r = Reassembler::new();
+        let req = make_request("api.anthropic.com", "/v1/messages", simple_anthropic_body());
+        let resp = make_response(200, "application/json", simple_response_body());
+        let request_direction = agtap_common::TCP_FLAG;
+        let response_direction = agtap_common::TCP_FLAG | 1;
+
+        assert_eq!(actual_direction(request_direction), 0);
+        assert_eq!(actual_direction(response_direction), 1);
+        assert!(r
+            .process_event(
+                PID,
+                SSL_PTR,
+                actual_direction(request_direction),
+                &req,
+                1000,
+                "",
+            )
+            .is_none());
+
+        let result = r.process_event(
+            PID,
+            SSL_PTR,
+            actual_direction(response_direction),
+            &resp,
+            2000,
+            "",
+        );
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().1.request.path, "/v1/messages");
     }
 
     #[test]
