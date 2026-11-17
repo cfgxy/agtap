@@ -14,7 +14,7 @@ use crate::reassembly::HttpExchange;
 /// Default body size to retain (512 KiB). Larger bodies are truncated.
 pub const MAX_BODY_RETAIN_SIZE: usize = 512 * 1024;
 /// Hard upper bound for retained request/response bodies.
-pub const MAX_BODY_RETAIN_HARD_LIMIT: usize = 64 * 1024 * 1024;
+pub const MAX_BODY_RETAIN_HARD_LIMIT: usize = agtap_common::MAX_CAPTURE_BODY_SIZE;
 
 static BODY_RETAIN_SIZE: AtomicUsize = AtomicUsize::new(MAX_BODY_RETAIN_SIZE);
 

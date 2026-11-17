@@ -20,7 +20,7 @@ use agtap::reassembly::{ApiKind, HttpExchange};
 use agtap::stdio_reassembly::StdioReassembler;
 use agtap::tui;
 use agtap::{event_log, output, reassembly, socket, telemetry, tls};
-use agtap_common::{SslEvent, TCP_CLOSE_FLAG, TCP_FLAG};
+use agtap_common::{SslEvent, MAX_HTTP_HEADER_CAPTURE_SIZE, TCP_CLOSE_FLAG, TCP_FLAG};
 use telemetry::PrometheusMetrics;
 
 /// How often (seconds) we check for idle connections and run body store cleanup.
@@ -383,10 +383,11 @@ async fn drain_ring_events(
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    let retain_bytes = cli
+    let retain_bytes = (cli
         .max_body_retain_kb
         .saturating_mul(1024)
-        .min(providers::MAX_BODY_RETAIN_HARD_LIMIT as u64) as usize;
+        .min(providers::MAX_BODY_RETAIN_HARD_LIMIT as u64) as usize)
+        .clamp(1, providers::MAX_BODY_RETAIN_HARD_LIMIT);
     providers::set_max_body_retain_size(retain_bytes);
 
     // Handle subcommands — no root needed
@@ -577,7 +578,10 @@ async fn main() -> anyhow::Result<()> {
     // are attached only with an exact selected PID and the BPF map filters events
     // to sockets accepted by that process.
     if let Some(pid) = target_pid {
-        match bpf::load_and_attach_go_syscalls(&mut ebpf, pid) {
+        let syscall_capture_bytes = retain_bytes
+            .saturating_add(MAX_HTTP_HEADER_CAPTURE_SIZE)
+            .min(agtap_common::MAX_SYSCALL_CAPTURE_SIZE) as u32;
+        match bpf::load_and_attach_go_syscalls(&mut ebpf, pid, syscall_capture_bytes) {
             Ok(()) => eprintln!(
                 "agtap: Go read/write syscall tracepoints attached for PID {}",
                 pid

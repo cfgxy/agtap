@@ -33,13 +33,26 @@ const GO_SYSCALL_PROBES: &[(&str, &str)] = &[
 ];
 
 /// Attach syscall tracepoints for a single statically-linked Go server.
-/// The BPF-side PID map suppresses all unrelated system tracepoint traffic.
-pub fn load_and_attach_go_syscalls(ebpf: &mut aya::Ebpf, pid: i32) -> anyhow::Result<()> {
+/// `capture_max_bytes` is the configured body allowance plus a bounded HTTP
+/// header allowance. The BPF-side PID map suppresses unrelated tracepoint traffic.
+pub fn load_and_attach_go_syscalls(
+    ebpf: &mut aya::Ebpf,
+    pid: i32,
+    capture_max_bytes: u32,
+) -> anyhow::Result<()> {
     let mut target_pid = Array::<_, u32>::try_from(
         ebpf.map_mut("TARGET_PID")
             .expect("BPF target PID map must exist"),
     )?;
     target_pid.set(0, pid as u32, 0)?;
+    drop(target_pid);
+
+    let mut capture_limit = Array::<_, u32>::try_from(
+        ebpf.map_mut("GO_CAPTURE_MAX_BYTES")
+            .expect("BPF Go capture limit map must exist"),
+    )?;
+    capture_limit.set(0, capture_max_bytes, 0)?;
+    drop(capture_limit);
 
     for prog_name in [
         "go_accept_exit",

@@ -694,6 +694,37 @@ data: {\"type\":\"message_stop\"}\n\
     }
 
     #[test]
+    fn large_request_chunked_at_ebpf_event_size_reassembles_into_output() {
+        const BODY_SIZE: usize = 614_501;
+        let mut r = Reassembler::new();
+        let prefix = r#"{"model":"gpt-5.6-sol","messages":[{"role":"user","content":""#;
+        let suffix = r#""}]}"#;
+        let body = format!(
+            "{}{}{}",
+            prefix,
+            "x".repeat(BODY_SIZE - prefix.len() - suffix.len()),
+            suffix
+        );
+        assert_eq!(body.len(), BODY_SIZE);
+        let request = make_request("api.openai.com", "/v1/chat/completions", &body);
+        let response = make_response(
+            200,
+            "application/json",
+            r#"{"id":"chatcmpl-large","model":"gpt-5.6-sol","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+
+        for chunk in request.chunks(agtap_common::MAX_EVENT_DATA_SIZE) {
+            assert!(r.process_event(PID, SSL_PTR, 0, chunk, 1000, "").is_none());
+        }
+        let (_, exchange) = r
+            .process_event(PID, SSL_PTR, 1, &response, 2000, "")
+            .unwrap();
+        assert_eq!(exchange.request.body.len(), body.len());
+        let (call, _) = crate::providers::openai_completions::parse_exchange(exchange).unwrap();
+        assert_eq!(call.request_bytes, body.len() as u32);
+    }
+
+    #[test]
     fn test_basic_non_streaming_exchange() {
         let mut r = Reassembler::new();
         let req = make_request("api.anthropic.com", "/v1/messages", simple_anthropic_body());

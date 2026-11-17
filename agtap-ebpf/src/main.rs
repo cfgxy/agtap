@@ -9,8 +9,8 @@
 )]
 
 use agtap_common::{
-    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_DATA_SIZE, TCP_CLOSE_FLAG,
-    TCP_FLAG,
+    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_EVENT_DATA_SIZE,
+    MAX_SYSCALL_CAPTURE_SIZE, TCP_CLOSE_FLAG, TCP_FLAG,
 };
 use aya_ebpf::{
     helpers::{
@@ -24,6 +24,8 @@ use aya_ebpf::{
 
 mod vmlinux;
 use vmlinux::{file, inode, iovec};
+
+const MAX_EVENT_BYTES: u32 = MAX_EVENT_DATA_SIZE as u32;
 
 #[map]
 static ACTIVE_SSL_CALLS: HashMap<u64, SslReadArgs> = HashMap::with_max_entries(4096, 0);
@@ -42,6 +44,10 @@ static ACTIVE_TCP_RECV_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entr
 #[map]
 static TARGET_PID: Array<u32> = Array::with_max_entries(1, 0);
 
+// Configured from `--max-body-retain-kb`; zero disables Go syscall payload capture.
+#[map]
+static GO_CAPTURE_MAX_BYTES: Array<u32> = Array::with_max_entries(1, 0);
+
 #[map]
 static ACTIVE_GO_READ_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
 
@@ -56,8 +62,10 @@ static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
 #[map]
 static ACTIVE_VFS_READ_CALLS: HashMap<u64, VfsReadArgs> = HashMap::with_max_entries(8192, 0);
 
+// The maximum configured body plus its 64 KiB HTTP header allowance fits in
+// this 128 MiB ring as fixed-size event chunks plus metadata.
 #[map]
-static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
+static EVENTS: RingBuf = RingBuf::with_byte_size(128 * 1024 * 1024, 0);
 
 // SSL_set_fd(SSL *ssl, int fd)
 #[uprobe]
@@ -204,8 +212,8 @@ fn try_ssl_read_ex_ret(ctx: &RetProbeContext) -> Result<(), u32> {
 }
 
 fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
     } else {
         len
     };
@@ -246,25 +254,30 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // ── Plain HTTP capture via glibc send()/recv() uprobes ─────────────────
 
-fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
-    } else {
-        len
-    };
-    let safe_len = (capped_len & 0x3FFF) as usize;
+fn emit_tcp_event_chunk(
+    fd: u32,
+    buf_ptr: u64,
+    len: u32,
+    direction: u32,
+    filter_tls_record: bool,
+) -> Result<(), u32> {
+    // `len` is always bounded to MAX_EVENT_DATA_SIZE by the caller, which keeps the
+    // ring-buffer reservation and verifier-visible slice bounded.
+    let safe_len = (len & 0x3FFF) as usize;
 
-    // TLS record header filter: skip ciphertext to avoid ring buffer waste.
-    // TLS records start with content type 0x14-0x17. HTTP methods start >= 0x41.
-    let mut first_byte: u8 = 0;
-    unsafe {
-        let _ = bpf_probe_read_user_buf(
-            buf_ptr as *const u8,
-            core::slice::from_raw_parts_mut(&mut first_byte, 1),
-        );
-    }
-    if first_byte >= 0x14 && first_byte <= 0x17 {
-        return Ok(()); // Likely TLS record, skip
+    // Only inspect the first chunk. Subsequent chunks may naturally start with
+    // a TLS-record-looking byte even when the HTTP message is plaintext.
+    if filter_tls_record {
+        let mut first_byte: u8 = 0;
+        unsafe {
+            let _ = bpf_probe_read_user_buf(
+                buf_ptr as *const u8,
+                core::slice::from_raw_parts_mut(&mut first_byte, 1),
+            );
+        }
+        if first_byte >= 0x14 && first_byte <= 0x17 {
+            return Ok(()); // Likely TLS record, skip
+        }
     }
 
     if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
@@ -285,6 +298,51 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
             let _ = bpf_probe_read_user_buf(buf_ptr as *const u8, dst);
         }
         entry.submit(0);
+    }
+    Ok(())
+}
+
+fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
+    } else {
+        len
+    };
+    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, true)
+}
+
+const MAX_GO_SYSCALL_CHUNKS: u32 =
+    (MAX_SYSCALL_CAPTURE_SIZE as u32 + MAX_EVENT_BYTES - 1) / MAX_EVENT_BYTES;
+
+fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
+    let configured_limit = GO_CAPTURE_MAX_BYTES.get(0).copied().unwrap_or(0);
+    let mut remaining = if len > configured_limit {
+        configured_limit
+    } else {
+        len
+    };
+    let mut offset = 0u32;
+    let mut chunk_index = 0u32;
+
+    // Bounded by the shared body + HTTP header cap, so the verifier sees at most
+    // 4097 fixed-size 16 KiB reservations. No event or user-memory read exceeds one
+    // SslEvent payload.
+    while remaining > 0 && chunk_index < MAX_GO_SYSCALL_CHUNKS {
+        let chunk_len = if remaining > MAX_EVENT_BYTES {
+            MAX_EVENT_BYTES
+        } else {
+            remaining
+        };
+        emit_tcp_event_chunk(
+            fd,
+            buf_ptr + offset as u64,
+            chunk_len,
+            direction,
+            chunk_index == 0,
+        )?;
+        remaining -= chunk_len;
+        offset += chunk_len;
+        chunk_index += 1;
     }
     Ok(())
 }
@@ -406,7 +464,7 @@ fn emit_go_call(
     if !is_go_server_fd(pid, fd) {
         return Ok(());
     }
-    emit_tcp_event(fd, buf_ptr, ret as u32, direction)
+    emit_go_tcp_events(fd, buf_ptr, ret as u32, direction)
 }
 
 #[tracepoint]
@@ -530,8 +588,8 @@ fn read_pipe_ino(file_ptr: *const file) -> Result<Option<u64>, u32> {
 }
 
 fn emit_pipe_event(ino: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
     } else {
         len
     };
