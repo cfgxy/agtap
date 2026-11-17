@@ -20,7 +20,7 @@ use agtap::reassembly::{ApiKind, HttpExchange};
 use agtap::stdio_reassembly::StdioReassembler;
 use agtap::tui;
 use agtap::{event_log, output, reassembly, socket, telemetry, tls};
-use agtap_common::{SslEvent, TCP_FLAG};
+use agtap_common::{SslEvent, TCP_CLOSE_FLAG, TCP_FLAG};
 use telemetry::PrometheusMetrics;
 
 /// How often (seconds) we check for idle connections and run body store cleanup.
@@ -242,12 +242,9 @@ async fn drain_ring_events(
             .trim_end_matches('\0')
             .to_string();
 
-        if data_len == 0 {
-            continue;
-        }
-
         let is_pipe = StdioReassembler::is_pipe_event(event.direction);
         let is_tcp = (event.direction & TCP_FLAG) != 0;
+        let is_tcp_close = is_tcp && (event.direction & TCP_CLOSE_FLAG) != 0;
         let actual_dir = reassembly::actual_direction(event.direction);
 
         if verbose {
@@ -314,21 +311,37 @@ async fn drain_ring_events(
                 sinks.emit(&agent_event).await;
             }
         } else {
-            // SSL or TCP event — apply comm filter (existing behavior)
-            if let (Some(ref filter), None) = (comm_filter, target_pid) {
-                if comm != *filter {
+            // The syscall tracepoints are global, so enforce the selected PID
+            // again before accepting TCP or SSL data in userspace.
+            if let Some(pid) = target_pid {
+                if event.pid != pid as u32 {
                     continue;
                 }
             }
 
             // Connection ID encoding uses upper 4 bits as type tag:
             //   0x0_... = SSL pointer (from SSL uprobe, ssl_ptr field is real pointer)
-            //   0x1_... = TCP fd (from send/recv uprobe, ssl_ptr field contains fd)
+            //   0x1_... = TCP fd (from send/recv uprobe or Go syscall tracepoint)
             let conn_id = if is_tcp {
                 event.ssl_ptr | (1u64 << 60) // type tag: TCP
             } else {
                 event.ssl_ptr // type tag: SSL (0x0)
             };
+
+            if is_tcp_close {
+                reassembler.close_connection(event.pid, conn_id);
+                continue;
+            }
+            if data_len == 0 {
+                continue;
+            }
+
+            // SSL or TCP event — apply comm filter (existing behavior)
+            if let (Some(ref filter), None) = (comm_filter, target_pid) {
+                if comm != *filter {
+                    continue;
+                }
+            }
 
             if let Some((api_kind, exchange)) = reassembler.process_event(
                 event.pid,
@@ -558,6 +571,24 @@ async fn main() -> anyhow::Result<()> {
             "Plain HTTP capture unavailable: {} (only TLS traffic will be captured)",
             e
         );
+    }
+
+    // A statically linked Go server bypasses libc send/recv. Syscall tracepoints
+    // are attached only with an exact selected PID and the BPF map filters events
+    // to sockets accepted by that process.
+    if let Some(pid) = target_pid {
+        match bpf::load_and_attach_go_syscalls(&mut ebpf, pid) {
+            Ok(()) => eprintln!(
+                "agtap: Go read/write syscall tracepoints attached for PID {}",
+                pid
+            ),
+            Err(err) => warn!(
+                "Go direct-syscall HTTP capture unavailable for PID {}: {}",
+                pid, err
+            ),
+        }
+    } else {
+        info!("Go direct-syscall HTTP capture requires --pid or a resolved --comm target");
     }
 
     let boot_time_ns = get_boot_time_ns();

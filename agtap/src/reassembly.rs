@@ -101,6 +101,13 @@ impl Reassembler {
         Self::default()
     }
 
+    /// Forget a connection when the kernel reports its file descriptor closed.
+    /// This prevents state from an incomplete exchange leaking into a later
+    /// connection that reuses the same `(pid, fd)` identifier.
+    pub fn close_connection(&mut self, pid: u32, connection_id: u64) {
+        self.streams.remove(&(pid, connection_id));
+    }
+
     /// Normalize and process a captured TCP or SSL event.
     pub fn process_event(
         &mut self,
@@ -660,6 +667,30 @@ data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"end_turn\"},\"usa
 event: message_stop\n\
 data: {\"type\":\"message_stop\"}\n\
 \n".to_string()
+    }
+
+    #[test]
+    fn close_lifecycle_discards_incomplete_exchange_before_fd_reuse() {
+        let mut r = Reassembler::new();
+        let first = make_request("api.anthropic.com", "/v1/messages", "{\"model\":\"first\"}");
+        let second = make_request(
+            "api.anthropic.com",
+            "/v1/messages",
+            "{\"model\":\"second\"}",
+        );
+        let response = make_response(200, "application/json", "{\"answer\":\"second\"}");
+
+        assert!(r.process_event(PID, SSL_PTR, 0, &first, 1000, "").is_none());
+        // This is the production lifecycle call made for a TCP close event;
+        // it is not test-only state cleanup.
+        r.close_connection(PID, SSL_PTR);
+        assert!(r
+            .process_event(PID, SSL_PTR, 0, &second, 2000, "")
+            .is_none());
+        let (_, exchange) = r
+            .process_event(PID, SSL_PTR, 1, &response, 3000, "")
+            .unwrap();
+        assert_eq!(exchange.request.body, b"{\"model\":\"second\"}");
     }
 
     #[test]

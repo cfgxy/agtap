@@ -5,8 +5,10 @@ pub const MAX_DATA_SIZE: usize = 16384;
 // Direction field bit allocation:
 //   bit 0:       direction (0 = write/request, 1 = read/response)
 //   bits 1-29:   reserved
-//   bit 30:      TCP_FLAG — event from libc send()/recv() uprobe
+//   bit 29:      TCP_CLOSE_FLAG — close lifecycle event for a TCP connection
+//   bit 30:      TCP_FLAG — event from libc send()/recv() uprobe or Go syscall tracepoint
 //   bit 31:      PIPE_FLAG — event from vfs_write/vfs_read kprobe
+pub const TCP_CLOSE_FLAG: u32 = 0x2000_0000;
 pub const TCP_FLAG: u32 = 0x4000_0000;
 
 #[repr(C)]

@@ -9,16 +9,17 @@
 )]
 
 use agtap_common::{
-    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_DATA_SIZE, TCP_FLAG,
+    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_DATA_SIZE, TCP_CLOSE_FLAG,
+    TCP_FLAG,
 };
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_buf,
     },
-    macros::{kprobe, kretprobe, map, uprobe, uretprobe},
-    maps::{HashMap, RingBuf},
-    programs::{ProbeContext, RetProbeContext},
+    macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
+    maps::{Array, HashMap, RingBuf},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 
 mod vmlinux;
@@ -35,6 +36,22 @@ static SSL_FD_MAP: HashMap<u64, u32> = HashMap::with_max_entries(4096, 0);
 
 #[map]
 static ACTIVE_TCP_RECV_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
+
+// Go's statically linked runtime invokes read(2)/write(2) directly, bypassing libc.
+// The host configures this to the exact target TGID before tracepoints are attached.
+#[map]
+static TARGET_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+#[map]
+static ACTIVE_GO_READ_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
+
+#[map]
+static ACTIVE_GO_WRITE_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
+
+// Only accepted server sockets are captured: this excludes unrelated files and
+// outbound provider sockets owned by the target process.
+#[map]
+static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
 
 #[map]
 static ACTIVE_VFS_READ_CALLS: HashMap<u64, VfsReadArgs> = HashMap::with_max_entries(8192, 0);
@@ -328,6 +345,162 @@ fn try_tcp_recv_ret(ctx: &RetProbeContext) -> Result<(), u32> {
         return Ok(());
     }
     emit_tcp_event(fd, buf_ptr, ret as u32, 1) // direction=1 (read)
+}
+
+// ── Go direct-syscall HTTP capture ──────────────────────────────────────
+//
+// Go's net package issues read(2), write(2), accept4(2), and close(2)
+// directly from its statically linked runtime.  We track only sockets accepted
+// by the selected server process.  `read` therefore represents the inbound
+// HTTP request and `write` the outbound HTTP response.
+const SYSCALL_FD_OFFSET: usize = 16;
+const SYSCALL_BUF_OFFSET: usize = 24;
+const SYSCALL_RET_OFFSET: usize = 16;
+
+fn target_pid() -> u32 {
+    TARGET_PID.get(0).copied().unwrap_or(0)
+}
+
+fn is_target_process() -> bool {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let target = target_pid();
+    target != 0 && pid == target
+}
+
+fn tcp_connection_key(pid: u32, fd: u32) -> u64 {
+    ((pid as u64) << 32) | fd as u64
+}
+
+fn is_go_server_fd(pid: u32, fd: u32) -> bool {
+    unsafe { GO_SERVER_FDS.get(&tcp_connection_key(pid, fd)).is_some() }
+}
+
+fn stash_go_call(ctx: &TracePointContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
+    if !is_target_process() {
+        return Ok(());
+    }
+    let fd = unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET).map_err(|_| 1u32)? } as u32;
+    let buf_ptr = unsafe { ctx.read_at::<u64>(SYSCALL_BUF_OFFSET).map_err(|_| 1u32)? };
+    let key = bpf_get_current_pid_tgid();
+    calls
+        .insert(&key, &TcpRecvArgs { fd, buf_ptr }, 0)
+        .map_err(|_| 1u32)
+}
+
+fn emit_go_call(
+    ctx: &TracePointContext,
+    calls: &HashMap<u64, TcpRecvArgs>,
+    direction: u32,
+) -> Result<(), u32> {
+    let key = bpf_get_current_pid_tgid();
+    let args = unsafe { calls.get(&key).ok_or(1u32)? };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = calls.remove(&key);
+
+    let ret = unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET).map_err(|_| 1u32)? };
+    if ret <= 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    if !is_go_server_fd(pid, fd) {
+        return Ok(());
+    }
+    emit_tcp_event(fd, buf_ptr, ret as u32, direction)
+}
+
+#[tracepoint]
+pub fn go_accept_exit(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret < 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let fd = ret as u32;
+    match GO_SERVER_FDS.insert(&tcp_connection_key(pid, fd), &1, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_read_enter(ctx: TracePointContext) -> u32 {
+    match stash_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_read_exit(ctx: TracePointContext) -> u32 {
+    match emit_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_write_enter(ctx: TracePointContext) -> u32 {
+    match stash_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_write_exit(ctx: TracePointContext) -> u32 {
+    match emit_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn emit_tcp_close(fd: u32) -> Result<(), u32> {
+    if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
+        let event = entry.as_mut_ptr();
+        let pid_tgid = bpf_get_current_pid_tgid();
+        unsafe {
+            (*event).timestamp_ns = bpf_ktime_get_ns();
+            (*event).pid = (pid_tgid >> 32) as u32;
+            (*event).tid = pid_tgid as u32;
+            (*event).ssl_ptr = fd as u64;
+            (*event).fd = fd;
+            (*event).direction = TCP_FLAG | TCP_CLOSE_FLAG;
+            (*event).data_len = 0;
+            if let Ok(comm) = bpf_get_current_comm() {
+                (*event).comm = comm;
+            }
+        }
+        entry.submit(0);
+    }
+    Ok(())
+}
+
+#[tracepoint]
+pub fn go_close_enter(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let fd = match unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET) } {
+        Ok(fd) => fd as u32,
+        Err(_) => return 1,
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let key = tcp_connection_key(pid, fd);
+    if unsafe { GO_SERVER_FDS.get(&key).is_none() } {
+        return 0;
+    }
+    let _ = GO_SERVER_FDS.remove(&key);
+    match emit_tcp_close(fd) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 // ── Pipe (stdio MCP) kprobes ───────────────────────────────────────────
