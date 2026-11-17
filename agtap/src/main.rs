@@ -333,7 +333,7 @@ async fn drain_ring_events(
             if let Some((api_kind, exchange)) = reassembler.process_event(
                 event.pid,
                 conn_id,
-                actual_dir,
+                event.direction,
                 actual_data,
                 event.timestamp_ns,
                 &comm,

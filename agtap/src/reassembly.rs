@@ -101,8 +101,28 @@ impl Reassembler {
         Self::default()
     }
 
-    /// Process an SSL event. Returns a completed exchange with its API kind if one is ready.
+    /// Normalize and process a captured TCP or SSL event.
     pub fn process_event(
+        &mut self,
+        pid: u32,
+        ssl_ptr: u64,
+        direction: u32,
+        data: &[u8],
+        timestamp_ns: u64,
+        comm: &str,
+    ) -> Option<(ApiKind, HttpExchange)> {
+        self.process_normalized_event(
+            pid,
+            ssl_ptr,
+            actual_direction(direction),
+            data,
+            timestamp_ns,
+            comm,
+        )
+    }
+
+    /// Process a normalized event. Returns a completed exchange with its API kind if one is ready.
+    fn process_normalized_event(
         &mut self,
         pid: u32,
         ssl_ptr: u64,
@@ -677,24 +697,10 @@ data: {\"type\":\"message_stop\"}\n\
         assert_eq!(actual_direction(request_direction), 0);
         assert_eq!(actual_direction(response_direction), 1);
         assert!(r
-            .process_event(
-                PID,
-                SSL_PTR,
-                actual_direction(request_direction),
-                &req,
-                1000,
-                "",
-            )
+            .process_event(PID, SSL_PTR, request_direction, &req, 1000, "")
             .is_none());
 
-        let result = r.process_event(
-            PID,
-            SSL_PTR,
-            actual_direction(response_direction),
-            &resp,
-            2000,
-            "",
-        );
+        let result = r.process_event(PID, SSL_PTR, response_direction, &resp, 2000, "");
         assert!(result.is_some());
         assert_eq!(result.unwrap().1.request.path, "/v1/messages");
     }
