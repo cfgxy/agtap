@@ -62,7 +62,7 @@ static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
 #[map]
 static ACTIVE_VFS_READ_CALLS: HashMap<u64, VfsReadArgs> = HashMap::with_max_entries(8192, 0);
 
-// 2 MiB body + 64 KiB header allowance fits in this map while leaving headroom
+// 1 MiB body + 64 KiB header allowance fits in this map while leaving headroom
 // for producer/consumer overlap. It is also below typical 8 MiB memlock limits.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(4 * 1024 * 1024, 0);
@@ -324,8 +324,8 @@ fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result
     let mut offset = 0u32;
     let mut chunk_index = 0u32;
 
-    // Bounded by the shared 2 MiB body + HTTP header cap, so the verifier sees
-    // at most 133 fixed-size 16 KiB reservations. No event or user-memory read exceeds one
+    // Bounded by the shared 1 MiB body + HTTP header cap, so the verifier sees
+    // at most 69 fixed-size 16 KiB reservations. No event or user-memory read exceeds one
     // SslEvent payload.
     while remaining > 0 && chunk_index < MAX_GO_SYSCALL_CHUNKS {
         let chunk_len = if remaining > MAX_EVENT_BYTES {

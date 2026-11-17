@@ -99,7 +99,7 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 | `--metrics-addr <ADDR>` | Expose Prometheus metrics (e.g., `127.0.0.1:9464`) |
 | `--max-body-store <MB>` | Max body storage on disk (default: 500 MB) |
 | `--body-retention <HOURS>` | Body file retention period (default: 24h) |
-| `--max-body-retain-kb <KB>` | Max request/response body retained per detail file (default: 512 KiB, hard cap: 2 MiB; values above the cap fail rather than silently truncating Go syscall capture) |
+| `--max-body-retain-kb <KB>` | Max request/response body retained per detail file (default: 512 KiB, hard cap: 1 MiB; values above the cap fail rather than silently truncating Go syscall capture) |
 
 For a selected `--pid`/`--comm` target, agtap refuses to start if the Go direct-syscall tracepoint programs cannot load and attach. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.
 | `--max-log-size <MB>` | Max event log size before rotation (default: 50) |

@@ -124,7 +124,7 @@ struct Cli {
     #[arg(long, default_value = "24")]
     body_retention: u64,
 
-    /// Maximum request/response body retained in each detail file (default: 512 KiB; hard cap: 2048 KiB)
+    /// Maximum request/response body retained in each detail file (default: 512 KiB; hard cap: 1024 KiB)
     #[arg(long, default_value = "512")]
     max_body_retain_kb: u64,
 
@@ -849,13 +849,13 @@ mod tests {
 
     #[test]
     fn body_retain_limit_accepts_supported_go_capture_maximum() {
-        assert_eq!(body_retain_bytes(2048).unwrap(), 2 * 1024 * 1024);
+        assert_eq!(body_retain_bytes(1024).unwrap(), 1024 * 1024);
     }
 
     #[test]
     fn body_retain_limit_rejects_unsupported_value_instead_of_clamping() {
-        let error = body_retain_bytes(2049).unwrap_err().to_string();
+        let error = body_retain_bytes(1025).unwrap_err().to_string();
         assert!(error.contains("rejected"));
-        assert!(error.contains("2048 KiB"));
+        assert!(error.contains("1024 KiB"));
     }
 }
