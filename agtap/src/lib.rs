@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+pub mod archive;
 pub mod body_store;
 pub mod event_log;
 pub mod output;

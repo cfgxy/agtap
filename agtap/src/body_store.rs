@@ -1,7 +1,8 @@
+use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use crate::providers::HttpDetail;
 
@@ -88,7 +89,7 @@ impl BodyStore {
     }
 
     /// Delete old files and enforce size limit. Called periodically (every 10 min).
-    pub fn cleanup_if_needed(&mut self) {
+    pub fn cleanup_if_needed(&mut self, protected_paths: &HashSet<PathBuf>) {
         if self.last_cleanup.elapsed().as_secs() < CLEANUP_INTERVAL_SECS {
             return;
         }
@@ -120,6 +121,9 @@ impl BodyStore {
 
         // Pass 1: delete files older than retention
         files.retain(|&(ref path, size, modified)| {
+            if protected_paths.contains(path) {
+                return true;
+            }
             let age = now.duration_since(modified).unwrap_or_default();
             if age.as_secs() > self.retention_secs {
                 if fs::remove_file(path).is_ok() {
@@ -139,10 +143,87 @@ impl BodyStore {
                 if self.total_bytes <= target {
                     break;
                 }
+                if protected_paths.contains(path) {
+                    continue;
+                }
                 if fs::remove_file(path).is_ok() {
                     self.total_bytes = self.total_bytes.saturating_sub(*size);
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashSet;
+    use tempfile::TempDir;
+
+    #[test]
+    fn cleanup_does_not_remove_protected_body() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BodyStore::open(dir.path(), 0, 24).unwrap();
+        let detail = crate::providers::test_helpers::make_exchange(
+            "example.test",
+            "/v1/test",
+            b"request",
+            b"response",
+        );
+        let http_detail = crate::providers::build_http_detail(&detail, &detail.response.body);
+        let body_path = store.write(1, 1, "event", &http_detail).unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        let mut protected = HashSet::new();
+        protected.insert(body_path.clone());
+        store.cleanup_if_needed(&protected);
+        assert!(body_path.exists());
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        store.cleanup_if_needed(&HashSet::new());
+        assert!(!body_path.exists());
+    }
+
+    #[test]
+    fn cleanup_protects_body_during_unqueued_rotation_recovery() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let body_path = body_dir.join("body.json");
+        fs::write(&body_path, br#"{"request_body":"hello"}"#).unwrap();
+        let log = dir.path().join("events.jsonl");
+        fs::write(
+            &log,
+            format!(r#"{{"id":"e1","body_path":"{}"}}"#, body_path.display()) + "\n",
+        )
+        .unwrap();
+
+        let source_len = fs::metadata(&log).unwrap().len();
+        queue.begin_rotation(&log, source_len).unwrap();
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        let protected_before_enqueue = queue.protected_body_paths(None);
+        assert!(protected_before_enqueue.contains(&body_path));
+        store.cleanup_if_needed(&protected_before_enqueue);
+        assert!(
+            body_path.exists(),
+            "intent must protect body before job creation"
+        );
+
+        let rotated = dir.path().join("events.jsonl.1");
+        fs::rename(&log, &rotated).unwrap();
+        queue.recover_rotations(&log, "tests").unwrap();
+        assert_eq!(queue.pending_count(), 1);
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        let protected_after_recovery = queue.protected_body_paths(None);
+        assert!(protected_after_recovery.contains(&body_path));
+        store.cleanup_if_needed(&protected_after_recovery);
+        assert!(
+            body_path.exists(),
+            "recovered job must keep body available for packaging"
+        );
     }
 }

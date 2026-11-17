@@ -7,11 +7,25 @@ pub mod openai_responses;
 use flate2::read::{DeflateDecoder, GzDecoder};
 use serde::{Deserialize, Serialize};
 use std::io::Read;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::reassembly::HttpExchange;
 
-/// Maximum body size to retain (512 KB). Larger bodies are truncated.
+/// Default body size to retain (512 KiB). Larger bodies are truncated.
 pub const MAX_BODY_RETAIN_SIZE: usize = 512 * 1024;
+/// Hard upper bound for retained request/response bodies.
+pub const MAX_BODY_RETAIN_HARD_LIMIT: usize = 64 * 1024 * 1024;
+
+static BODY_RETAIN_SIZE: AtomicUsize = AtomicUsize::new(MAX_BODY_RETAIN_SIZE);
+
+pub fn set_max_body_retain_size(bytes: usize) -> usize {
+    let clamped = bytes.clamp(1, MAX_BODY_RETAIN_HARD_LIMIT);
+    BODY_RETAIN_SIZE.swap(clamped, Ordering::Relaxed)
+}
+
+pub fn max_body_retain_size() -> usize {
+    BODY_RETAIN_SIZE.load(Ordering::Relaxed)
+}
 
 /// Full HTTP request + response detail for the detail view.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -32,16 +46,17 @@ pub(crate) fn build_http_detail(
     decoded_response_body: &[u8],
 ) -> HttpDetail {
     let request_body_str = String::from_utf8_lossy(&exchange.request.body);
-    let request_body = if request_body_str.len() > MAX_BODY_RETAIN_SIZE {
-        let end = request_body_str.floor_char_boundary(MAX_BODY_RETAIN_SIZE);
+    let max_body_size = max_body_retain_size();
+    let request_body = if request_body_str.len() > max_body_size {
+        let end = request_body_str.floor_char_boundary(max_body_size);
         format!("{}[truncated]", &request_body_str[..end])
     } else {
         request_body_str.into_owned()
     };
 
     let response_body_str = String::from_utf8_lossy(decoded_response_body);
-    let response_body = if response_body_str.len() > MAX_BODY_RETAIN_SIZE {
-        let end = response_body_str.floor_char_boundary(MAX_BODY_RETAIN_SIZE);
+    let response_body = if response_body_str.len() > max_body_size {
+        let end = response_body_str.floor_char_boundary(max_body_size);
         format!("{}[truncated]", &response_body_str[..end])
     } else {
         response_body_str.into_owned()
@@ -373,6 +388,19 @@ pub(crate) mod test_helpers {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_body_retain_limit_is_configurable_and_clamped() {
+        let previous = set_max_body_retain_size(4);
+        let exchange =
+            test_helpers::make_exchange("example.test", "/v1/test", b"123456", b"abcdef");
+        let detail = build_http_detail(&exchange, b"abcdef");
+        assert_eq!(detail.request_body, "1234[truncated]");
+        assert_eq!(detail.response_body, "abcd[truncated]");
+        assert_eq!(set_max_body_retain_size(MAX_BODY_RETAIN_HARD_LIMIT + 1), 4);
+        assert_eq!(max_body_retain_size(), MAX_BODY_RETAIN_HARD_LIMIT);
+        set_max_body_retain_size(previous);
+    }
 
     #[test]
     fn test_partial_gzip_decompression() {

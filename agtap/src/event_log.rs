@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
+use crate::archive::ArchiveQueue;
 use crate::output::AgentEvent;
 
 pub struct LogWriter {
@@ -10,7 +12,9 @@ pub struct LogWriter {
     bytes_written: u64,
     max_bytes: u64,
     max_files: usize,
-    rotation_failed: bool,
+    archive_queue: Option<Arc<ArchiveQueue>>,
+    archive_prefix: String,
+    archive_recovery_needed: bool,
 }
 
 fn open_log_file(path: &Path) -> anyhow::Result<File> {
@@ -47,20 +51,44 @@ impl LogWriter {
             bytes_written,
             max_bytes,
             max_files: max_files.max(1),
-            rotation_failed: false,
+            archive_queue: None,
+            archive_prefix: "agtap".to_string(),
+            archive_recovery_needed: false,
         })
     }
 
+    pub fn set_archive_queue(
+        &mut self,
+        queue: Arc<ArchiveQueue>,
+        prefix: String,
+    ) -> anyhow::Result<()> {
+        queue.recover_rotations(&self.log_path, &prefix)?;
+        self.archive_queue = Some(queue);
+        self.archive_prefix = prefix;
+        self.archive_recovery_needed = false;
+        Ok(())
+    }
+
     pub fn write_event(&mut self, event: &AgentEvent) {
+        if self.archive_recovery_needed {
+            if let Some(queue) = &self.archive_queue {
+                match queue.recover_rotations(&self.log_path, &self.archive_prefix) {
+                    Ok(()) => self.archive_recovery_needed = false,
+                    Err(err) => {
+                        eprintln!("agtap: archive rotation recovery failed: {err}");
+                    }
+                }
+            }
+        }
         if let Ok(json) = serde_json::to_string(event) {
             let len = json.len() as u64 + 1; // +1 for newline
             if writeln!(self.writer, "{}", json).is_ok() {
                 let _ = self.writer.flush();
                 self.bytes_written += len;
-                if self.bytes_written >= self.max_bytes && !self.rotation_failed {
+                if self.bytes_written >= self.max_bytes {
                     if let Err(e) = self.rotate() {
                         eprintln!("agtap: log rotation failed: {}", e);
-                        self.rotation_failed = true;
+                        self.archive_recovery_needed = self.archive_queue.is_some();
                     }
                 }
             }
@@ -69,6 +97,12 @@ impl LogWriter {
 
     fn rotate(&mut self) -> anyhow::Result<()> {
         let _ = self.writer.flush();
+
+        let rotation_id = self
+            .archive_queue
+            .as_ref()
+            .map(|queue| queue.begin_rotation(&self.log_path, self.bytes_written))
+            .transpose()?;
 
         // Delete the oldest rotated file if it exists
         let oldest = rotated_path(&self.log_path, self.max_files);
@@ -93,6 +127,15 @@ impl LogWriter {
         let file = open_log_file(&self.log_path)?;
         self.writer = BufWriter::new(file);
         self.bytes_written = 0;
+
+        if let Some(queue) = &self.archive_queue {
+            if let Some(rotation_id) = rotation_id {
+                queue
+                    .enqueue_rotation(&rotation_id, &self.archive_prefix, &first_rotated)
+                    .map_err(|err| anyhow::anyhow!("persist archive job: {err}"))?;
+                queue.complete_rotation(&rotation_id)?;
+            }
+        }
         Ok(())
     }
 }
@@ -259,6 +302,48 @@ mod tests {
         let log_path = dir.path().join("events.jsonl");
         let writer = LogWriter::open(&log_path, 100, 0).unwrap();
         assert_eq!(writer.max_files, 1);
+    }
+
+    #[test]
+    fn test_archive_snapshot_survives_rotated_rename() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let queue = Arc::new(ArchiveQueue::open(dir.path()).unwrap());
+        let mut writer = LogWriter::open(&log_path, 50, 2).unwrap();
+        writer
+            .set_archive_queue(queue.clone(), "tests".to_string())
+            .unwrap();
+
+        for _ in 0..30 {
+            writer.write_event(&make_event());
+        }
+
+        assert!(dir.path().join("events.jsonl.1").exists());
+        assert!(dir.path().join("events.jsonl.2").exists());
+        assert!(queue.pending_count() >= 2);
+        assert!(dir
+            .path()
+            .join("archive/closed")
+            .read_dir()
+            .unwrap()
+            .next()
+            .is_some());
+    }
+
+    #[test]
+    fn rotation_retries_after_transient_error() {
+        let dir = TempDir::new().unwrap();
+        let log_path = dir.path().join("events.jsonl");
+        let blocked = dir.path().join("events.jsonl.1");
+        fs::create_dir(&blocked).unwrap();
+        let mut writer = LogWriter::open(&log_path, 1, 1).unwrap();
+
+        writer.write_event(&make_event());
+        assert!(blocked.is_dir());
+
+        fs::remove_dir(&blocked).unwrap();
+        writer.write_event(&make_event());
+        assert!(blocked.is_file(), "a later event should retry rotation");
     }
 
     #[test]

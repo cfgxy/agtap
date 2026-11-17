@@ -12,6 +12,7 @@ use log::{info, warn};
 use tokio::signal;
 use tokio::sync::mpsc;
 
+use agtap::archive::{self, ArchiveConfig, ArchiveQueue};
 use agtap::body_store::BodyStore;
 use agtap::pipe;
 use agtap::providers::{self, anthropic, gemini, mcp, openai_completions, openai_responses};
@@ -123,6 +124,10 @@ struct Cli {
     #[arg(long, default_value = "24")]
     body_retention: u64,
 
+    /// Maximum request/response body retained in each detail file (default: 512 KiB)
+    #[arg(long, default_value = "512")]
+    max_body_retain_kb: u64,
+
     /// Expose Prometheus metrics endpoint (e.g. 127.0.0.1:9464)
     #[arg(long)]
     metrics_addr: Option<String>,
@@ -134,6 +139,26 @@ struct Cli {
     /// Maximum number of rotated log files to keep (default: 3)
     #[arg(long, default_value = "3")]
     max_log_files: usize,
+
+    /// S3-compatible endpoint. Leave unset for AWS S3.
+    #[arg(long)]
+    archive_s3_endpoint: Option<String>,
+
+    /// S3 bucket enabling asynchronous archive uploads.
+    #[arg(long)]
+    archive_s3_bucket: Option<String>,
+
+    /// Object key prefix for archived packages (default: agtap)
+    #[arg(long, default_value = "agtap")]
+    archive_s3_prefix: String,
+
+    /// S3 region (default: us-east-1)
+    #[arg(long, default_value = "us-east-1")]
+    archive_s3_region: String,
+
+    /// Base delay before retrying a failed archive upload (seconds)
+    #[arg(long, default_value = "5")]
+    archive_retry_delay_secs: u64,
 }
 
 #[derive(Subcommand, Debug)]
@@ -344,6 +369,12 @@ async fn drain_ring_events(
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
+
+    let retain_bytes = cli
+        .max_body_retain_kb
+        .saturating_mul(1024)
+        .min(providers::MAX_BODY_RETAIN_HARD_LIMIT as u64) as usize;
+    providers::set_max_body_retain_size(retain_bytes);
 
     // Handle subcommands — no root needed
     match cli.command {
@@ -561,9 +592,46 @@ async fn main() -> anyhow::Result<()> {
         None
     };
 
+    let runtime_dir = agtap::default_runtime_dir();
+    let archive_queue = cli
+        .archive_s3_bucket
+        .as_ref()
+        .map(|_| {
+            ArchiveQueue::open(&runtime_dir)
+                .map(Arc::new)
+                .map_err(|err| anyhow::anyhow!("open archive queue: {err}"))
+        })
+        .transpose()?;
+
+    let archive_handle = if let (Some(bucket), Some(queue)) =
+        (cli.archive_s3_bucket.clone(), archive_queue.clone())
+    {
+        let config = ArchiveConfig {
+            endpoint: cli.archive_s3_endpoint.clone(),
+            bucket,
+            region: cli.archive_s3_region.clone(),
+            retry_delay_secs: cli.archive_retry_delay_secs,
+        };
+        match archive::start(queue.clone(), config).await {
+            Ok(handle) => {
+                eprintln!("agtap: asynchronous S3 archive enabled");
+                Some(handle)
+            }
+            Err(err) => {
+                eprintln!("agtap: S3 archive disabled: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     let log_path = event_log::default_log_path();
     let max_log_bytes = cli.max_log_size * 1024 * 1024;
     let mut log_writer = event_log::LogWriter::open(&log_path, max_log_bytes, cli.max_log_files)?;
+    if let Some(queue) = archive_queue.clone() {
+        log_writer.set_archive_queue(queue, cli.archive_s3_prefix.clone())?;
+    }
     eprintln!("agtap: logging to {}", log_path.display());
 
     let sock_path = socket::default_sock_path();
@@ -577,7 +645,6 @@ async fn main() -> anyhow::Result<()> {
     let mut last_cleanup = Instant::now();
     let mut process_name_cache: HashMap<u32, String> = HashMap::new();
 
-    let runtime_dir = agtap::default_runtime_dir();
     let bodies_dir = runtime_dir.join("bodies");
     let mut body_store = BodyStore::open(&bodies_dir, cli.max_body_store, cli.body_retention)?;
     eprintln!("agtap: body store at {}", bodies_dir.display());
@@ -663,7 +730,11 @@ async fn main() -> anyhow::Result<()> {
 
         if last_cleanup.elapsed().as_secs() > CLEANUP_CHECK_INTERVAL_SECS {
             let partials = reassembler.cleanup_idle(IDLE_TIMEOUT_SECS, STREAMING_IDLE_TIMEOUT_SECS);
-            body_store.cleanup_if_needed();
+            let protected_body_paths = archive_queue
+                .as_ref()
+                .map(|queue| queue.protected_body_paths(None))
+                .unwrap_or_default();
+            body_store.cleanup_if_needed(&protected_body_paths);
             stdio_reassembler.cleanup_idle(IDLE_TIMEOUT_SECS);
             process_name_cache.retain(|pid, _| fs::metadata(format!("/proc/{}", pid)).is_ok());
             last_cleanup = Instant::now();
@@ -718,6 +789,10 @@ async fn main() -> anyhow::Result<()> {
 
     // Clean up socket file
     let _ = std::fs::remove_file(&sock_path);
+
+    if let Some(handle) = archive_handle {
+        handle.shutdown().await;
+    }
 
     Ok(())
 }
