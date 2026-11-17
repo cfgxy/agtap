@@ -124,7 +124,7 @@ struct Cli {
     #[arg(long, default_value = "24")]
     body_retention: u64,
 
-    /// Maximum request/response body retained in each detail file (default: 512 KiB)
+    /// Maximum request/response body retained in each detail file (default: 512 KiB; hard cap: 2048 KiB)
     #[arg(long, default_value = "512")]
     max_body_retain_kb: u64,
 
@@ -379,16 +379,23 @@ async fn drain_ring_events(
     }
 }
 
+fn body_retain_bytes(max_body_retain_kb: u64) -> anyhow::Result<usize> {
+    let requested = max_body_retain_kb
+        .checked_mul(1024)
+        .ok_or_else(|| anyhow::anyhow!("--max-body-retain-kb is too large"))?;
+    let maximum = providers::MAX_BODY_RETAIN_HARD_LIMIT as u64;
+    if requested == 0 || requested > maximum {
+        anyhow::bail!(
+            "--max-body-retain-kb must be between 1 and {} KiB; larger values are rejected so Go direct-syscall capture cannot silently omit body data",
+            maximum / 1024
+        );
+    }
+    Ok(requested as usize)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    let retain_bytes = (cli
-        .max_body_retain_kb
-        .saturating_mul(1024)
-        .min(providers::MAX_BODY_RETAIN_HARD_LIMIT as u64) as usize)
-        .clamp(1, providers::MAX_BODY_RETAIN_HARD_LIMIT);
-    providers::set_max_body_retain_size(retain_bytes);
 
     // Handle subcommands — no root needed
     match cli.command {
@@ -440,6 +447,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Capture mode (default) ──────────────────────────────────────────
+
+    let retain_bytes = body_retain_bytes(cli.max_body_retain_kb)?;
+    providers::set_max_body_retain_size(retain_bytes);
 
     if cli.verbose {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -581,16 +591,17 @@ async fn main() -> anyhow::Result<()> {
         let syscall_capture_bytes = retain_bytes
             .saturating_add(MAX_HTTP_HEADER_CAPTURE_SIZE)
             .min(agtap_common::MAX_SYSCALL_CAPTURE_SIZE) as u32;
-        match bpf::load_and_attach_go_syscalls(&mut ebpf, pid, syscall_capture_bytes) {
-            Ok(()) => eprintln!(
-                "agtap: Go read/write syscall tracepoints attached for PID {}",
-                pid
-            ),
-            Err(err) => warn!(
-                "Go direct-syscall HTTP capture unavailable for PID {}: {}",
-                pid, err
-            ),
-        }
+        bpf::load_and_attach_go_syscalls(&mut ebpf, pid, syscall_capture_bytes).map_err(|err| {
+            anyhow::anyhow!(
+                "Go direct-syscall HTTP capture could not load for PID {}; refusing to start without the selected target's capture path: {}",
+                pid,
+                err
+            )
+        })?;
+        eprintln!(
+            "agtap: Go read/write syscall tracepoints attached for PID {}",
+            pid
+        );
     } else {
         info!("Go direct-syscall HTTP capture requires --pid or a resolved --comm target");
     }
@@ -830,4 +841,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_retain_bytes;
+
+    #[test]
+    fn body_retain_limit_accepts_supported_go_capture_maximum() {
+        assert_eq!(body_retain_bytes(2048).unwrap(), 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn body_retain_limit_rejects_unsupported_value_instead_of_clamping() {
+        let error = body_retain_bytes(2049).unwrap_err().to_string();
+        assert!(error.contains("rejected"));
+        assert!(error.contains("2048 KiB"));
+    }
 }

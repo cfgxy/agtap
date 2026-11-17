@@ -6,9 +6,13 @@ pub const MAX_DATA_SIZE: usize = 16384;
 /// wraps a 16 KiB payload to zero.
 pub const MAX_EVENT_DATA_SIZE: usize = MAX_DATA_SIZE - 1;
 /// Maximum body retention configured by `--max-body-retain-kb`.
-/// The eBPF Go syscall path uses the same ceiling when chunking one large
-/// read/write syscall into ring-buffer events.
-pub const MAX_CAPTURE_BODY_SIZE: usize = 64 * 1024 * 1024;
+///
+/// This is deliberately capped at 2 MiB: the direct Go syscall tracepoint
+/// emitter must split a single syscall into fixed-size events, and this ceiling
+/// keeps its statically bounded control flow below the target 5.14 verifier
+/// complexity limit. The CLI rejects, rather than silently truncating, larger
+/// requested values.
+pub const MAX_CAPTURE_BODY_SIZE: usize = 2 * 1024 * 1024;
 /// Extra bytes retained by the syscall event source for HTTP start-lines and
 /// headers, which are not part of the configured body limit.
 pub const MAX_HTTP_HEADER_CAPTURE_SIZE: usize = 64 * 1024;
