@@ -59,10 +59,10 @@ static ACTIVE_GO_WRITE_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entr
 #[map]
 static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
 
-// Keep each emitter under the verifier's 1M-instruction limit while reducing
-// tail-call hops: 24 fixed-size chunks need at most two continuations for the
-// 1 MiB + header capture limit.
-const GO_EVENTS_PER_TAIL_CALL: u32 = 24;
+// Go's eBPF tail calls can execute at most 33 programs per syscall. Emit three
+// fixed-size chunks per program so the 1 MiB + header capture limit fits without
+// a verifier-expanded 69-iteration loop.
+const GO_EVENTS_PER_TAIL_CALL: u32 = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -340,9 +340,9 @@ fn emit_go_tcp_event_batch(_ctx: &TracePointContext) -> Result<bool, u32> {
     let key = bpf_get_current_pid_tgid();
     let mut state = unsafe { *GO_EMIT_STATES.get(&key).ok_or(1u32)? };
 
-    // This bounded 24-iteration batch stays below the kernel verifier's path
-    // explosion threshold. Further chunks continue through the program-array
-    // tail call below.
+    // This bounded three-iteration batch is deliberately kept below the kernel
+    // verifier's path explosion threshold. Further chunks continue through the
+    // program-array tail call below.
     let mut emitted = 0u32;
     while state.remaining > 0 && emitted < GO_EVENTS_PER_TAIL_CALL {
         let chunk_len = if state.remaining > MAX_EVENT_BYTES {
