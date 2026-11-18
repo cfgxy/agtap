@@ -336,7 +336,7 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
 const MAX_GO_SYSCALL_CHUNKS: u32 =
     (MAX_SYSCALL_CAPTURE_SIZE as u32 + MAX_EVENT_BYTES - 1) / MAX_EVENT_BYTES;
 
-fn emit_go_tcp_event_batch(ctx: &TracePointContext) -> Result<(), u32> {
+fn emit_go_tcp_event_batch(_ctx: &TracePointContext) -> Result<bool, u32> {
     let key = bpf_get_current_pid_tgid();
     let mut state = unsafe { *GO_EMIT_STATES.get(&key).ok_or(1u32)? };
 
@@ -365,16 +365,11 @@ fn emit_go_tcp_event_batch(ctx: &TracePointContext) -> Result<(), u32> {
 
     if state.remaining == 0 || state.chunk_index >= MAX_GO_SYSCALL_CHUNKS {
         let _ = GO_EMIT_STATES.remove(&key);
-        return Ok(());
+        return Ok(false);
     }
 
     GO_EMIT_STATES.insert(&key, &state, 0).map_err(|_| 1u32)?;
-    // A successful tail call never returns. If the jump table is not populated,
-    // discard the pending state rather than leaking it into a later syscall.
-    if unsafe { GO_EMIT_CHAIN.tail_call(ctx, 0) }.is_err() {
-        let _ = GO_EMIT_STATES.remove(&key);
-    }
-    Ok(())
+    Ok(true)
 }
 
 fn begin_go_tcp_events(
@@ -383,7 +378,7 @@ fn begin_go_tcp_events(
     buf_ptr: u64,
     len: u32,
     direction: u32,
-) -> Result<(), u32> {
+) -> Result<bool, u32> {
     let configured_limit = GO_CAPTURE_MAX_BYTES.get(0).copied().unwrap_or(0);
     let remaining = if len > configured_limit {
         configured_limit
@@ -391,7 +386,7 @@ fn begin_go_tcp_events(
         len
     };
     if remaining == 0 {
-        return Ok(());
+        return Ok(false);
     }
     let key = bpf_get_current_pid_tgid();
     let state = GoEmitState {
@@ -508,7 +503,7 @@ fn emit_go_call(
     ctx: &TracePointContext,
     calls: &HashMap<u64, TcpRecvArgs>,
     direction: u32,
-) -> Result<(), u32> {
+) -> Result<bool, u32> {
     let key = bpf_get_current_pid_tgid();
     let args = unsafe { calls.get(&key).ok_or(1u32)? };
     let fd = args.fd;
@@ -517,11 +512,11 @@ fn emit_go_call(
 
     let ret = unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET).map_err(|_| 1u32)? };
     if ret <= 0 {
-        return Ok(());
+        return Ok(false);
     }
     let pid = (key >> 32) as u32;
     if !is_go_server_fd(pid, fd) {
-        return Ok(());
+        return Ok(false);
     }
     begin_go_tcp_events(ctx, fd, buf_ptr, ret as u32, direction)
 }
@@ -531,7 +526,13 @@ fn emit_go_call(
 #[tracepoint]
 pub fn go_emit_chunks(ctx: TracePointContext) -> u32 {
     match emit_go_tcp_event_batch(&ctx) {
-        Ok(()) => 0,
+        Ok(true) => {
+            // This must be directly in the `u32`-returning eBPF entrypoint:
+            // Linux 5.14 rejects bpf_tail_call from a Result-returning helper.
+            let _ = unsafe { GO_EMIT_CHAIN.tail_call(&ctx, 0) };
+            0
+        }
+        Ok(false) => 0,
         Err(_) => 1,
     }
 }
@@ -567,7 +568,11 @@ pub fn go_read_enter(ctx: TracePointContext) -> u32 {
 #[tracepoint]
 pub fn go_read_exit(ctx: TracePointContext) -> u32 {
     match emit_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
-        Ok(()) => 0,
+        Ok(true) => {
+            let _ = unsafe { GO_EMIT_CHAIN.tail_call(&ctx, 0) };
+            0
+        }
+        Ok(false) => 0,
         Err(_) => 1,
     }
 }
@@ -583,7 +588,11 @@ pub fn go_write_enter(ctx: TracePointContext) -> u32 {
 #[tracepoint]
 pub fn go_write_exit(ctx: TracePointContext) -> u32 {
     match emit_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
-        Ok(()) => 0,
+        Ok(true) => {
+            let _ = unsafe { GO_EMIT_CHAIN.tail_call(&ctx, 0) };
+            0
+        }
+        Ok(false) => 0,
         Err(_) => 1,
     }
 }
