@@ -18,7 +18,7 @@ use aya_ebpf::{
         bpf_probe_read_user_buf,
     },
     macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, ProgramArray, RingBuf},
     programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 
@@ -58,6 +58,28 @@ static ACTIVE_GO_WRITE_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entr
 // outbound provider sockets owned by the target process.
 #[map]
 static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
+
+// Go's eBPF tail calls can execute at most 33 programs per syscall. Emit three
+// fixed-size chunks per program so the 1 MiB + header capture limit fits without
+// a verifier-expanded 69-iteration loop.
+const GO_EVENTS_PER_TAIL_CALL: u32 = 3;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct GoEmitState {
+    fd: u32,
+    direction: u32,
+    buf_ptr: u64,
+    remaining: u32,
+    offset: u32,
+    chunk_index: u32,
+}
+
+#[map]
+static GO_EMIT_STATES: HashMap<u64, GoEmitState> = HashMap::with_max_entries(4096, 0);
+
+#[map]
+static GO_EMIT_CHAIN: ProgramArray = ProgramArray::with_max_entries(1, 0);
 
 #[map]
 static ACTIVE_VFS_READ_CALLS: HashMap<u64, VfsReadArgs> = HashMap::with_max_entries(8192, 0);
@@ -314,37 +336,74 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
 const MAX_GO_SYSCALL_CHUNKS: u32 =
     (MAX_SYSCALL_CAPTURE_SIZE as u32 + MAX_EVENT_BYTES - 1) / MAX_EVENT_BYTES;
 
-fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
+fn emit_go_tcp_event_batch(ctx: &TracePointContext) -> Result<(), u32> {
+    let key = bpf_get_current_pid_tgid();
+    let mut state = unsafe { *GO_EMIT_STATES.get(&key).ok_or(1u32)? };
+
+    // This bounded three-iteration batch is deliberately kept below the kernel
+    // verifier's path explosion threshold. Further chunks continue through the
+    // program-array tail call below.
+    let mut emitted = 0u32;
+    while state.remaining > 0 && emitted < GO_EVENTS_PER_TAIL_CALL {
+        let chunk_len = if state.remaining > MAX_EVENT_BYTES {
+            MAX_EVENT_BYTES
+        } else {
+            state.remaining
+        };
+        emit_tcp_event_chunk(
+            state.fd,
+            state.buf_ptr + state.offset as u64,
+            chunk_len,
+            state.direction,
+            state.chunk_index == 0,
+        )?;
+        state.remaining -= chunk_len;
+        state.offset += chunk_len;
+        state.chunk_index += 1;
+        emitted += 1;
+    }
+
+    if state.remaining == 0 || state.chunk_index >= MAX_GO_SYSCALL_CHUNKS {
+        let _ = GO_EMIT_STATES.remove(&key);
+        return Ok(());
+    }
+
+    GO_EMIT_STATES.insert(&key, &state, 0).map_err(|_| 1u32)?;
+    // A successful tail call never returns. If the jump table is not populated,
+    // discard the pending state rather than leaking it into a later syscall.
+    if unsafe { GO_EMIT_CHAIN.tail_call(ctx, 0) }.is_err() {
+        let _ = GO_EMIT_STATES.remove(&key);
+    }
+    Ok(())
+}
+
+fn begin_go_tcp_events(
+    ctx: &TracePointContext,
+    fd: u32,
+    buf_ptr: u64,
+    len: u32,
+    direction: u32,
+) -> Result<(), u32> {
     let configured_limit = GO_CAPTURE_MAX_BYTES.get(0).copied().unwrap_or(0);
-    let mut remaining = if len > configured_limit {
+    let remaining = if len > configured_limit {
         configured_limit
     } else {
         len
     };
-    let mut offset = 0u32;
-    let mut chunk_index = 0u32;
-
-    // Bounded by the shared 1 MiB body + HTTP header cap, so the verifier sees
-    // at most 69 fixed-size 16 KiB reservations. No event or user-memory read exceeds one
-    // SslEvent payload.
-    while remaining > 0 && chunk_index < MAX_GO_SYSCALL_CHUNKS {
-        let chunk_len = if remaining > MAX_EVENT_BYTES {
-            MAX_EVENT_BYTES
-        } else {
-            remaining
-        };
-        emit_tcp_event_chunk(
-            fd,
-            buf_ptr + offset as u64,
-            chunk_len,
-            direction,
-            chunk_index == 0,
-        )?;
-        remaining -= chunk_len;
-        offset += chunk_len;
-        chunk_index += 1;
+    if remaining == 0 {
+        return Ok(());
     }
-    Ok(())
+    let key = bpf_get_current_pid_tgid();
+    let state = GoEmitState {
+        fd,
+        direction,
+        buf_ptr,
+        remaining,
+        offset: 0,
+        chunk_index: 0,
+    };
+    GO_EMIT_STATES.insert(&key, &state, 0).map_err(|_| 1u32)?;
+    emit_go_tcp_event_batch(ctx)
 }
 
 // send(int fd, const void *buf, size_t len, int flags)
@@ -464,7 +523,17 @@ fn emit_go_call(
     if !is_go_server_fd(pid, fd) {
         return Ok(());
     }
-    emit_go_tcp_events(fd, buf_ptr, ret as u32, direction)
+    begin_go_tcp_events(ctx, fd, buf_ptr, ret as u32, direction)
+}
+
+// Continuation for large Go syscall buffers. It is loaded but not attached;
+// GO_EMIT_CHAIN invokes it only from go_read_exit/go_write_exit.
+#[tracepoint]
+pub fn go_emit_chunks(ctx: TracePointContext) -> u32 {
+    match emit_go_tcp_event_batch(&ctx) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
 }
 
 #[tracepoint]
