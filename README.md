@@ -112,6 +112,8 @@ For a selected `--pid`/`--comm` target, agtap refuses to start if the Go direct-
 
 One syscall is emitted as at most three fixed-size ring-buffer events of 512 KiB each, which covers the 1 MiB body cap plus the 64 KiB HTTP header allowance. The event ring buffer holds 16 MiB (~32 records).
 
+The Go syscall capture is bound to the selected PID. If a containerized target is recreated, the PID changes and agtap must be restarted to re-attach — otherwise forwarding keeps working but capture silently stops. Archived rotation snapshots and their bodies are deleted after a verified upload; the live rotated logs (`events.jsonl.1`…`.N`) stay locally per `--max-log-files`, so size that knob against available disk. See [docs/s3-archive.md](docs/s3-archive.md).
+
 ### Environment variables
 
 | Variable | Description |
