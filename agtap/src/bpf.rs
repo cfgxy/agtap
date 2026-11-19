@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use aya::{
-    maps::{Array, ProgramArray},
+    maps::Array,
     programs::{KProbe, TracePoint, UProbe},
 };
 use log::{debug, info, warn};
@@ -60,7 +60,6 @@ pub fn load_and_attach_go_syscalls(
         "go_read_exit",
         "go_write_enter",
         "go_write_exit",
-        "go_emit_chunks",
         "go_close_enter",
     ] {
         let prog: &mut TracePoint = ebpf
@@ -69,16 +68,6 @@ pub fn load_and_attach_go_syscalls(
             .try_into()?;
         prog.load()?;
     }
-    let mut emit_chain = ProgramArray::try_from(
-        ebpf.take_map("GO_EMIT_CHAIN")
-            .expect("BPF Go emit chain map must exist"),
-    )?;
-    let emit_chunks: &mut TracePoint = ebpf
-        .program_mut("go_emit_chunks")
-        .expect("BPF Go emit continuation must exist")
-        .try_into()?;
-    emit_chain.set(0, emit_chunks.fd()?, 0)?;
-
     for (prog_name, tracepoint) in GO_SYSCALL_PROBES {
         let prog: &mut TracePoint = ebpf
             .program_mut(prog_name)

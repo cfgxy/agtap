@@ -1,9 +1,9 @@
 #![cfg_attr(not(feature = "user"), no_std)]
 
-pub const MAX_DATA_SIZE: usize = 16384;
+pub const MAX_DATA_SIZE: usize = 512 * 1024;
 /// Largest payload safely copied into one fixed-size eBPF ring-buffer event.
-/// One byte remains unused so the verifier-visible `len & 0x3fff` bound never
-/// wraps a 16 KiB payload to zero.
+/// One byte remains unused so the verifier-visible `len & 0x7ffff` bound never
+/// wraps a maximum-size payload to zero.
 pub const MAX_EVENT_DATA_SIZE: usize = MAX_DATA_SIZE - 1;
 /// Maximum body retention configured by `--max-body-retain-kb`.
 ///
