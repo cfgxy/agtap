@@ -1,7 +1,10 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use aya::programs::{KProbe, UProbe};
+use aya::{
+    maps::Array,
+    programs::{KProbe, TracePoint, UProbe},
+};
 use log::{debug, info, warn};
 
 pub const SSL_PROBES: &[(&str, &[&str])] = &[
@@ -18,6 +21,62 @@ pub const LIBC_PROBES: &[(&str, &[&str])] = &[
     ("tcp_recv_entry", &["recv"]),
     ("tcp_recv_ret", &["recv"]),
 ];
+
+const GO_SYSCALL_PROBES: &[(&str, &str)] = &[
+    ("go_accept_exit", "sys_exit_accept"),
+    ("go_accept_exit", "sys_exit_accept4"),
+    ("go_read_enter", "sys_enter_read"),
+    ("go_read_exit", "sys_exit_read"),
+    ("go_write_enter", "sys_enter_write"),
+    ("go_write_exit", "sys_exit_write"),
+    ("go_close_enter", "sys_enter_close"),
+];
+
+/// Attach syscall tracepoints for a single statically-linked Go server.
+/// `capture_max_bytes` is the configured body allowance plus a bounded HTTP
+/// header allowance. The BPF-side PID map suppresses unrelated tracepoint traffic.
+pub fn load_and_attach_go_syscalls(
+    ebpf: &mut aya::Ebpf,
+    pid: i32,
+    capture_max_bytes: u32,
+) -> anyhow::Result<()> {
+    let mut target_pid = Array::<_, u32>::try_from(
+        ebpf.map_mut("TARGET_PID")
+            .expect("BPF target PID map must exist"),
+    )?;
+    target_pid.set(0, pid as u32, 0)?;
+    drop(target_pid);
+
+    let mut capture_limit = Array::<_, u32>::try_from(
+        ebpf.map_mut("GO_CAPTURE_MAX_BYTES")
+            .expect("BPF Go capture limit map must exist"),
+    )?;
+    capture_limit.set(0, capture_max_bytes, 0)?;
+    drop(capture_limit);
+
+    for prog_name in [
+        "go_accept_exit",
+        "go_read_enter",
+        "go_read_exit",
+        "go_write_enter",
+        "go_write_exit",
+        "go_close_enter",
+    ] {
+        let prog: &mut TracePoint = ebpf
+            .program_mut(prog_name)
+            .expect("BPF syscall program must exist")
+            .try_into()?;
+        prog.load()?;
+    }
+    for (prog_name, tracepoint) in GO_SYSCALL_PROBES {
+        let prog: &mut TracePoint = ebpf
+            .program_mut(prog_name)
+            .expect("BPF syscall program must exist")
+            .try_into()?;
+        prog.attach("syscalls", tracepoint)?;
+    }
+    Ok(())
+}
 
 pub fn load_and_attach(
     ebpf: &mut aya::Ebpf,

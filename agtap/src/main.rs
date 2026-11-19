@@ -20,7 +20,7 @@ use agtap::reassembly::{ApiKind, HttpExchange};
 use agtap::stdio_reassembly::StdioReassembler;
 use agtap::tui;
 use agtap::{event_log, output, reassembly, socket, telemetry, tls};
-use agtap_common::{SslEvent, TCP_FLAG};
+use agtap_common::{SslEvent, MAX_HTTP_HEADER_CAPTURE_SIZE, TCP_CLOSE_FLAG, TCP_FLAG};
 use telemetry::PrometheusMetrics;
 
 /// How often (seconds) we check for idle connections and run body store cleanup.
@@ -124,7 +124,7 @@ struct Cli {
     #[arg(long, default_value = "24")]
     body_retention: u64,
 
-    /// Maximum request/response body retained in each detail file (default: 512 KiB)
+    /// Maximum request/response body retained in each detail file (default: 512 KiB; hard cap: 1024 KiB)
     #[arg(long, default_value = "512")]
     max_body_retain_kb: u64,
 
@@ -242,13 +242,10 @@ async fn drain_ring_events(
             .trim_end_matches('\0')
             .to_string();
 
-        if data_len == 0 {
-            continue;
-        }
-
         let is_pipe = StdioReassembler::is_pipe_event(event.direction);
         let is_tcp = (event.direction & TCP_FLAG) != 0;
-        let actual_dir = event.direction & 1;
+        let is_tcp_close = is_tcp && (event.direction & TCP_CLOSE_FLAG) != 0;
+        let actual_dir = reassembly::actual_direction(event.direction);
 
         if verbose {
             let source = if is_pipe {
@@ -314,21 +311,37 @@ async fn drain_ring_events(
                 sinks.emit(&agent_event).await;
             }
         } else {
-            // SSL or TCP event — apply comm filter (existing behavior)
-            if let (Some(ref filter), None) = (comm_filter, target_pid) {
-                if comm != *filter {
+            // The syscall tracepoints are global, so enforce the selected PID
+            // again before accepting TCP or SSL data in userspace.
+            if let Some(pid) = target_pid {
+                if event.pid != pid as u32 {
                     continue;
                 }
             }
 
             // Connection ID encoding uses upper 4 bits as type tag:
             //   0x0_... = SSL pointer (from SSL uprobe, ssl_ptr field is real pointer)
-            //   0x1_... = TCP fd (from send/recv uprobe, ssl_ptr field contains fd)
+            //   0x1_... = TCP fd (from send/recv uprobe or Go syscall tracepoint)
             let conn_id = if is_tcp {
                 event.ssl_ptr | (1u64 << 60) // type tag: TCP
             } else {
                 event.ssl_ptr // type tag: SSL (0x0)
             };
+
+            if is_tcp_close {
+                reassembler.close_connection(event.pid, conn_id);
+                continue;
+            }
+            if data_len == 0 {
+                continue;
+            }
+
+            // SSL or TCP event — apply comm filter (existing behavior)
+            if let (Some(ref filter), None) = (comm_filter, target_pid) {
+                if comm != *filter {
+                    continue;
+                }
+            }
 
             if let Some((api_kind, exchange)) = reassembler.process_event(
                 event.pid,
@@ -366,15 +379,23 @@ async fn drain_ring_events(
     }
 }
 
+fn body_retain_bytes(max_body_retain_kb: u64) -> anyhow::Result<usize> {
+    let requested = max_body_retain_kb
+        .checked_mul(1024)
+        .ok_or_else(|| anyhow::anyhow!("--max-body-retain-kb is too large"))?;
+    let maximum = providers::MAX_BODY_RETAIN_HARD_LIMIT as u64;
+    if requested == 0 || requested > maximum {
+        anyhow::bail!(
+            "--max-body-retain-kb must be between 1 and {} KiB; larger values are rejected so Go direct-syscall capture cannot silently omit body data",
+            maximum / 1024
+        );
+    }
+    Ok(requested as usize)
+}
+
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
-
-    let retain_bytes = cli
-        .max_body_retain_kb
-        .saturating_mul(1024)
-        .min(providers::MAX_BODY_RETAIN_HARD_LIMIT as u64) as usize;
-    providers::set_max_body_retain_size(retain_bytes);
 
     // Handle subcommands — no root needed
     match cli.command {
@@ -426,6 +447,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // ── Capture mode (default) ──────────────────────────────────────────
+
+    let retain_bytes = body_retain_bytes(cli.max_body_retain_kb)?;
+    providers::set_max_body_retain_size(retain_bytes);
 
     if cli.verbose {
         env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("debug")).init();
@@ -558,6 +582,28 @@ async fn main() -> anyhow::Result<()> {
             "Plain HTTP capture unavailable: {} (only TLS traffic will be captured)",
             e
         );
+    }
+
+    // A statically linked Go server bypasses libc send/recv. Syscall tracepoints
+    // are attached only with an exact selected PID and the BPF map filters events
+    // to sockets accepted by that process.
+    if let Some(pid) = target_pid {
+        let syscall_capture_bytes = retain_bytes
+            .saturating_add(MAX_HTTP_HEADER_CAPTURE_SIZE)
+            .min(agtap_common::MAX_SYSCALL_CAPTURE_SIZE) as u32;
+        bpf::load_and_attach_go_syscalls(&mut ebpf, pid, syscall_capture_bytes).map_err(|err| {
+            anyhow::anyhow!(
+                "Go direct-syscall HTTP capture could not load for PID {}; refusing to start without the selected target's capture path: {}",
+                pid,
+                err
+            )
+        })?;
+        eprintln!(
+            "agtap: Go read/write syscall tracepoints attached for PID {}",
+            pid
+        );
+    } else {
+        info!("Go direct-syscall HTTP capture requires --pid or a resolved --comm target");
     }
 
     let boot_time_ns = get_boot_time_ns();
@@ -795,4 +841,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::body_retain_bytes;
+
+    #[test]
+    fn body_retain_limit_accepts_supported_go_capture_maximum() {
+        assert_eq!(body_retain_bytes(1024).unwrap(), 1024 * 1024);
+    }
+
+    #[test]
+    fn body_retain_limit_rejects_unsupported_value_instead_of_clamping() {
+        let error = body_retain_bytes(1025).unwrap_err().to_string();
+        assert!(error.contains("rejected"));
+        assert!(error.contains("1024 KiB"));
+    }
 }

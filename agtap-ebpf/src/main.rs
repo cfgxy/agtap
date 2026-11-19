@@ -9,20 +9,26 @@
 )]
 
 use agtap_common::{
-    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_DATA_SIZE, TCP_FLAG,
+    SslEvent, SslReadArgs, SslReadExArgs, TcpRecvArgs, VfsReadArgs, MAX_EVENT_DATA_SIZE,
+    MAX_SYSCALL_CAPTURE_SIZE, TCP_CLOSE_FLAG, TCP_FLAG,
 };
 use aya_ebpf::{
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_buf,
     },
-    macros::{kprobe, kretprobe, map, uprobe, uretprobe},
-    maps::{HashMap, RingBuf},
-    programs::{ProbeContext, RetProbeContext},
+    macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
+    maps::{Array, HashMap, RingBuf},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 
 mod vmlinux;
 use vmlinux::{file, inode, iovec};
+
+const MAX_EVENT_BYTES: u32 = MAX_EVENT_DATA_SIZE as u32;
+// `MAX_EVENT_DATA_SIZE` is one less than a power of two, so it doubles as the
+// bitmask that bounds every verifier-visible ring-buffer payload length.
+const EVENT_LEN_MASK: u32 = MAX_EVENT_DATA_SIZE as u32;
 
 #[map]
 static ACTIVE_SSL_CALLS: HashMap<u64, SslReadArgs> = HashMap::with_max_entries(4096, 0);
@@ -36,9 +42,32 @@ static SSL_FD_MAP: HashMap<u64, u32> = HashMap::with_max_entries(4096, 0);
 #[map]
 static ACTIVE_TCP_RECV_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
 
+// Go's statically linked runtime invokes read(2)/write(2) directly, bypassing libc.
+// The host configures this to the exact target TGID before tracepoints are attached.
+#[map]
+static TARGET_PID: Array<u32> = Array::with_max_entries(1, 0);
+
+// Configured from `--max-body-retain-kb`; zero disables Go syscall payload capture.
+#[map]
+static GO_CAPTURE_MAX_BYTES: Array<u32> = Array::with_max_entries(1, 0);
+
+#[map]
+static ACTIVE_GO_READ_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
+
+#[map]
+static ACTIVE_GO_WRITE_CALLS: HashMap<u64, TcpRecvArgs> = HashMap::with_max_entries(4096, 0);
+
+// Only accepted server sockets are captured: this excludes unrelated files and
+// outbound provider sockets owned by the target process.
+#[map]
+static GO_SERVER_FDS: HashMap<u64, u8> = HashMap::with_max_entries(16384, 0);
+
 #[map]
 static ACTIVE_VFS_READ_CALLS: HashMap<u64, VfsReadArgs> = HashMap::with_max_entries(8192, 0);
 
+// Each event record carries one 512 KiB payload, so a 1 MiB body plus the 64 KiB
+// header allowance needs only three records. 16 MiB keeps ~32 records buffered
+// for producer/consumer overlap while staying well inside normal memlock limits.
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(16 * 1024 * 1024, 0);
 
@@ -187,13 +216,13 @@ fn try_ssl_read_ex_ret(ctx: &RetProbeContext) -> Result<(), u32> {
 }
 
 fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
     } else {
         len
     };
     // Bitmask to satisfy verifier
-    let safe_len = (capped_len & 0x3FFF) as usize;
+    let safe_len = (capped_len & EVENT_LEN_MASK) as usize;
 
     if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
         let event = entry.as_mut_ptr();
@@ -229,25 +258,30 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // ── Plain HTTP capture via glibc send()/recv() uprobes ─────────────────
 
-fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
-    } else {
-        len
-    };
-    let safe_len = (capped_len & 0x3FFF) as usize;
+fn emit_tcp_event_chunk(
+    fd: u32,
+    buf_ptr: u64,
+    len: u32,
+    direction: u32,
+    filter_tls_record: bool,
+) -> Result<(), u32> {
+    // `len` is always bounded to MAX_EVENT_DATA_SIZE by the caller, which keeps the
+    // ring-buffer reservation and verifier-visible slice bounded.
+    let safe_len = (len & EVENT_LEN_MASK) as usize;
 
-    // TLS record header filter: skip ciphertext to avoid ring buffer waste.
-    // TLS records start with content type 0x14-0x17. HTTP methods start >= 0x41.
-    let mut first_byte: u8 = 0;
-    unsafe {
-        let _ = bpf_probe_read_user_buf(
-            buf_ptr as *const u8,
-            core::slice::from_raw_parts_mut(&mut first_byte, 1),
-        );
-    }
-    if first_byte >= 0x14 && first_byte <= 0x17 {
-        return Ok(()); // Likely TLS record, skip
+    // Only inspect the first chunk. Subsequent chunks may naturally start with
+    // a TLS-record-looking byte even when the HTTP message is plaintext.
+    if filter_tls_record {
+        let mut first_byte: u8 = 0;
+        unsafe {
+            let _ = bpf_probe_read_user_buf(
+                buf_ptr as *const u8,
+                core::slice::from_raw_parts_mut(&mut first_byte, 1),
+            );
+        }
+        if first_byte >= 0x14 && first_byte <= 0x17 {
+            return Ok(()); // Likely TLS record, skip
+        }
     }
 
     if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
@@ -268,6 +302,51 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
             let _ = bpf_probe_read_user_buf(buf_ptr as *const u8, dst);
         }
         entry.submit(0);
+    }
+    Ok(())
+}
+
+fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
+    } else {
+        len
+    };
+    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, true)
+}
+
+const MAX_GO_SYSCALL_CHUNKS: u32 =
+    (MAX_SYSCALL_CAPTURE_SIZE as u32 + MAX_EVENT_BYTES - 1) / MAX_EVENT_BYTES;
+
+fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
+    let configured_limit = GO_CAPTURE_MAX_BYTES.get(0).copied().unwrap_or(0);
+    let mut remaining = if len > configured_limit {
+        configured_limit
+    } else {
+        len
+    };
+    let mut offset = 0u32;
+    let mut chunk_index = 0u32;
+
+    // Three fixed-size 512 KiB reservations cover the full 1 MiB body plus the
+    // 64 KiB header allowance. Keeping this at a small constant iteration count
+    // is what keeps the emitter below the 5.14 verifier complexity limit.
+    while remaining > 0 && chunk_index < MAX_GO_SYSCALL_CHUNKS {
+        let chunk_len = if remaining > MAX_EVENT_BYTES {
+            MAX_EVENT_BYTES
+        } else {
+            remaining
+        };
+        emit_tcp_event_chunk(
+            fd,
+            buf_ptr + offset as u64,
+            chunk_len,
+            direction,
+            chunk_index == 0,
+        )?;
+        remaining -= chunk_len;
+        offset += chunk_len;
+        chunk_index += 1;
     }
     Ok(())
 }
@@ -330,6 +409,162 @@ fn try_tcp_recv_ret(ctx: &RetProbeContext) -> Result<(), u32> {
     emit_tcp_event(fd, buf_ptr, ret as u32, 1) // direction=1 (read)
 }
 
+// ── Go direct-syscall HTTP capture ──────────────────────────────────────
+//
+// Go's net package issues read(2), write(2), accept4(2), and close(2)
+// directly from its statically linked runtime.  We track only sockets accepted
+// by the selected server process.  `read` therefore represents the inbound
+// HTTP request and `write` the outbound HTTP response.
+const SYSCALL_FD_OFFSET: usize = 16;
+const SYSCALL_BUF_OFFSET: usize = 24;
+const SYSCALL_RET_OFFSET: usize = 16;
+
+fn target_pid() -> u32 {
+    TARGET_PID.get(0).copied().unwrap_or(0)
+}
+
+fn is_target_process() -> bool {
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let target = target_pid();
+    target != 0 && pid == target
+}
+
+fn tcp_connection_key(pid: u32, fd: u32) -> u64 {
+    ((pid as u64) << 32) | fd as u64
+}
+
+fn is_go_server_fd(pid: u32, fd: u32) -> bool {
+    unsafe { GO_SERVER_FDS.get(&tcp_connection_key(pid, fd)).is_some() }
+}
+
+fn stash_go_call(ctx: &TracePointContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
+    if !is_target_process() {
+        return Ok(());
+    }
+    let fd = unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET).map_err(|_| 1u32)? } as u32;
+    let buf_ptr = unsafe { ctx.read_at::<u64>(SYSCALL_BUF_OFFSET).map_err(|_| 1u32)? };
+    let key = bpf_get_current_pid_tgid();
+    calls
+        .insert(&key, &TcpRecvArgs { fd, buf_ptr }, 0)
+        .map_err(|_| 1u32)
+}
+
+fn emit_go_call(
+    ctx: &TracePointContext,
+    calls: &HashMap<u64, TcpRecvArgs>,
+    direction: u32,
+) -> Result<(), u32> {
+    let key = bpf_get_current_pid_tgid();
+    let args = unsafe { calls.get(&key).ok_or(1u32)? };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = calls.remove(&key);
+
+    let ret = unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET).map_err(|_| 1u32)? };
+    if ret <= 0 {
+        return Ok(());
+    }
+    let pid = (key >> 32) as u32;
+    if !is_go_server_fd(pid, fd) {
+        return Ok(());
+    }
+    emit_go_tcp_events(fd, buf_ptr, ret as u32, direction)
+}
+
+#[tracepoint]
+pub fn go_accept_exit(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret < 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let fd = ret as u32;
+    match GO_SERVER_FDS.insert(&tcp_connection_key(pid, fd), &1, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_read_enter(ctx: TracePointContext) -> u32 {
+    match stash_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_read_exit(ctx: TracePointContext) -> u32 {
+    match emit_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_write_enter(ctx: TracePointContext) -> u32 {
+    match stash_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_write_exit(ctx: TracePointContext) -> u32 {
+    match emit_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+fn emit_tcp_close(fd: u32) -> Result<(), u32> {
+    if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
+        let event = entry.as_mut_ptr();
+        let pid_tgid = bpf_get_current_pid_tgid();
+        unsafe {
+            (*event).timestamp_ns = bpf_ktime_get_ns();
+            (*event).pid = (pid_tgid >> 32) as u32;
+            (*event).tid = pid_tgid as u32;
+            (*event).ssl_ptr = fd as u64;
+            (*event).fd = fd;
+            (*event).direction = TCP_FLAG | TCP_CLOSE_FLAG;
+            (*event).data_len = 0;
+            if let Ok(comm) = bpf_get_current_comm() {
+                (*event).comm = comm;
+            }
+        }
+        entry.submit(0);
+    }
+    Ok(())
+}
+
+#[tracepoint]
+pub fn go_close_enter(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let fd = match unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET) } {
+        Ok(fd) => fd as u32,
+        Err(_) => return 1,
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let key = tcp_connection_key(pid, fd);
+    if unsafe { GO_SERVER_FDS.get(&key).is_none() } {
+        return 0;
+    }
+    let _ = GO_SERVER_FDS.remove(&key);
+    match emit_tcp_close(fd) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 // ── Pipe (stdio MCP) kprobes ───────────────────────────────────────────
 
 const PIPE_FLAG: u32 = 0x80000000;
@@ -357,12 +592,12 @@ fn read_pipe_ino(file_ptr: *const file) -> Result<Option<u64>, u32> {
 }
 
 fn emit_pipe_event(ino: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
-    let capped_len = if len > MAX_DATA_SIZE as u32 {
-        MAX_DATA_SIZE as u32
+    let capped_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
     } else {
         len
     };
-    let safe_len = (capped_len & 0x3FFF) as usize;
+    let safe_len = (capped_len & EVENT_LEN_MASK) as usize;
 
     // Quick content check: first byte should be '{' for JSON
     let mut first_byte: u8 = 0;

@@ -90,13 +90,46 @@ pub struct Reassembler {
     streams: HashMap<(u32, u64), ConnState>,
 }
 
+/// Reduce capture direction values to the request/response bit consumed by the reassembler.
+/// TCP events carry `TCP_FLAG` in the upper bits; SSL events already use the same low bit.
+pub fn actual_direction(direction: u32) -> u32 {
+    direction & 1
+}
+
 impl Reassembler {
     pub fn new() -> Self {
         Self::default()
     }
 
-    /// Process an SSL event. Returns a completed exchange with its API kind if one is ready.
+    /// Forget a connection when the kernel reports its file descriptor closed.
+    /// This prevents state from an incomplete exchange leaking into a later
+    /// connection that reuses the same `(pid, fd)` identifier.
+    pub fn close_connection(&mut self, pid: u32, connection_id: u64) {
+        self.streams.remove(&(pid, connection_id));
+    }
+
+    /// Normalize and process a captured TCP or SSL event.
     pub fn process_event(
+        &mut self,
+        pid: u32,
+        ssl_ptr: u64,
+        direction: u32,
+        data: &[u8],
+        timestamp_ns: u64,
+        comm: &str,
+    ) -> Option<(ApiKind, HttpExchange)> {
+        self.process_normalized_event(
+            pid,
+            ssl_ptr,
+            actual_direction(direction),
+            data,
+            timestamp_ns,
+            comm,
+        )
+    }
+
+    /// Process a normalized event. Returns a completed exchange with its API kind if one is ready.
+    fn process_normalized_event(
         &mut self,
         pid: u32,
         ssl_ptr: u64,
@@ -637,6 +670,61 @@ data: {\"type\":\"message_stop\"}\n\
     }
 
     #[test]
+    fn close_lifecycle_discards_incomplete_exchange_before_fd_reuse() {
+        let mut r = Reassembler::new();
+        let first = make_request("api.anthropic.com", "/v1/messages", "{\"model\":\"first\"}");
+        let second = make_request(
+            "api.anthropic.com",
+            "/v1/messages",
+            "{\"model\":\"second\"}",
+        );
+        let response = make_response(200, "application/json", "{\"answer\":\"second\"}");
+
+        assert!(r.process_event(PID, SSL_PTR, 0, &first, 1000, "").is_none());
+        // This is the production lifecycle call made for a TCP close event;
+        // it is not test-only state cleanup.
+        r.close_connection(PID, SSL_PTR);
+        assert!(r
+            .process_event(PID, SSL_PTR, 0, &second, 2000, "")
+            .is_none());
+        let (_, exchange) = r
+            .process_event(PID, SSL_PTR, 1, &response, 3000, "")
+            .unwrap();
+        assert_eq!(exchange.request.body, b"{\"model\":\"second\"}");
+    }
+
+    #[test]
+    fn large_request_chunked_at_ebpf_event_size_reassembles_into_output() {
+        const BODY_SIZE: usize = 614_501;
+        let mut r = Reassembler::new();
+        let prefix = r#"{"model":"gpt-5.6-sol","messages":[{"role":"user","content":""#;
+        let suffix = r#""}]}"#;
+        let body = format!(
+            "{}{}{}",
+            prefix,
+            "x".repeat(BODY_SIZE - prefix.len() - suffix.len()),
+            suffix
+        );
+        assert_eq!(body.len(), BODY_SIZE);
+        let request = make_request("api.openai.com", "/v1/chat/completions", &body);
+        let response = make_response(
+            200,
+            "application/json",
+            r#"{"id":"chatcmpl-large","model":"gpt-5.6-sol","choices":[{"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1}}"#,
+        );
+
+        for chunk in request.chunks(agtap_common::MAX_EVENT_DATA_SIZE) {
+            assert!(r.process_event(PID, SSL_PTR, 0, chunk, 1000, "").is_none());
+        }
+        let (_, exchange) = r
+            .process_event(PID, SSL_PTR, 1, &response, 2000, "")
+            .unwrap();
+        assert_eq!(exchange.request.body.len(), body.len());
+        let (call, _) = crate::providers::openai_completions::parse_exchange(exchange).unwrap();
+        assert_eq!(call.request_bytes, body.len() as u32);
+    }
+
+    #[test]
     fn test_basic_non_streaming_exchange() {
         let mut r = Reassembler::new();
         let req = make_request("api.anthropic.com", "/v1/messages", simple_anthropic_body());
@@ -658,6 +746,25 @@ data: {\"type\":\"message_stop\"}\n\
         assert!(!exchange.response.is_streaming);
         assert_eq!(exchange.request.timestamp_ns, 1000);
         assert_eq!(exchange.response.first_byte_ns, Some(2000));
+    }
+
+    #[test]
+    fn test_tcp_flag_direction_is_normalized_at_reassembly_boundary() {
+        let mut r = Reassembler::new();
+        let req = make_request("api.anthropic.com", "/v1/messages", simple_anthropic_body());
+        let resp = make_response(200, "application/json", simple_response_body());
+        let request_direction = agtap_common::TCP_FLAG;
+        let response_direction = agtap_common::TCP_FLAG | 1;
+
+        assert_eq!(actual_direction(request_direction), 0);
+        assert_eq!(actual_direction(response_direction), 1);
+        assert!(r
+            .process_event(PID, SSL_PTR, request_direction, &req, 1000, "")
+            .is_none());
+
+        let result = r.process_event(PID, SSL_PTR, response_direction, &resp, 2000, "");
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().1.request.path, "/v1/messages");
     }
 
     #[test]
