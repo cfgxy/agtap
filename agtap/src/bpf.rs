@@ -1,8 +1,9 @@
 use std::collections::HashSet;
+use std::fs;
 use std::path::PathBuf;
 
 use aya::{
-    maps::Array,
+    maps::{Array, HashMap as AyaHashMap},
     programs::{KProbe, TracePoint, UProbe},
 };
 use log::{debug, info, warn};
@@ -31,6 +32,91 @@ const GO_SYSCALL_PROBES: &[(&str, &str)] = &[
     ("go_write_exit", "sys_exit_write"),
     ("go_close_enter", "sys_enter_close"),
 ];
+
+#[derive(Debug, PartialEq, Eq)]
+struct TcpSocket {
+    local_port: u16,
+    state: String,
+    inode: u64,
+}
+
+fn parse_tcp_socket(line: &str) -> Option<TcpSocket> {
+    let fields: Vec<_> = line.split_whitespace().collect();
+    let local_port = u16::from_str_radix(fields.get(1)?.rsplit_once(':')?.1, 16).ok()?;
+    Some(TcpSocket {
+        local_port,
+        state: fields.get(3)?.to_string(),
+        inode: fields.get(9)?.parse().ok()?,
+    })
+}
+
+fn target_tcp_sockets(pid: i32) -> Vec<TcpSocket> {
+    ["tcp", "tcp6"]
+        .into_iter()
+        .flat_map(|name| {
+            let path = format!("/proc/{pid}/net/{name}");
+            fs::read_to_string(path)
+                .map(|content| {
+                    content
+                        .lines()
+                        .skip(1)
+                        .filter_map(parse_tcp_socket)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+fn server_socket_inodes(sockets: &[TcpSocket]) -> HashSet<u64> {
+    let listening_ports: HashSet<_> = sockets
+        .iter()
+        .filter(|socket| socket.state == "0A")
+        .map(|socket| socket.local_port)
+        .collect();
+    sockets
+        .iter()
+        .filter(|socket| socket.state == "01" && listening_ports.contains(&socket.local_port))
+        .map(|socket| socket.inode)
+        .collect()
+}
+
+fn socket_inode(link: &std::path::Path) -> Option<u64> {
+    let link = fs::read_link(link).ok()?;
+    let text = link.to_string_lossy();
+    text.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+fn seed_go_server_fds(ebpf: &mut aya::Ebpf, pid: i32) -> anyhow::Result<usize> {
+    let sockets = target_tcp_sockets(pid);
+    let server_inodes = server_socket_inodes(&sockets);
+
+    if server_inodes.is_empty() {
+        return Ok(0);
+    }
+
+    let mut server_fds = AyaHashMap::<_, u64, u8>::try_from(
+        ebpf.map_mut("GO_SERVER_FDS")
+            .expect("BPF Go server FD map must exist"),
+    )?;
+    let mut seeded = 0;
+    for entry in fs::read_dir(format!("/proc/{pid}/fd"))? {
+        let entry = entry?;
+        let fd = match entry.file_name().to_string_lossy().parse::<u32>() {
+            Ok(fd) => fd,
+            Err(_) => continue,
+        };
+        if socket_inode(&entry.path()).is_some_and(|inode| server_inodes.contains(&inode)) {
+            let key = ((pid as u64) << 32) | fd as u64;
+            server_fds.insert(key, 1, 0)?;
+            seeded += 1;
+        }
+    }
+    Ok(seeded)
+}
 
 /// Attach syscall tracepoints for a single statically-linked Go server.
 /// `capture_max_bytes` is the configured body allowance plus a bounded HTTP
@@ -74,6 +160,13 @@ pub fn load_and_attach_go_syscalls(
             .expect("BPF syscall program must exist")
             .try_into()?;
         prog.attach("syscalls", tracepoint)?;
+    }
+    match seed_go_server_fds(ebpf, pid) {
+        Ok(0) => debug!("No established server sockets to seed for PID {pid}"),
+        Ok(count) => info!("Seeded {count} pre-existing Go server sockets for PID {pid}"),
+        Err(err) => warn!(
+            "Could not seed pre-existing Go server sockets for PID {pid}; new accepts remain tracked: {err}"
+        ),
     }
     Ok(())
 }
@@ -222,5 +315,48 @@ fn attach_extra_targets(
         if attached_any {
             eprintln!("agtap: attached {} probes to {}", label, path.display());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_tcp_socket, server_socket_inodes, TcpSocket};
+
+    #[test]
+    fn parses_established_proc_tcp_socket() {
+        let socket = parse_tcp_socket(
+            "  4: 0100007F:1F90 0100007F:A1B2 01 00000000:00000000 00:00000000 00000000  1000 0 12345 1",
+        )
+        .expect("valid proc tcp record");
+        assert_eq!(socket.local_port, 8080);
+        assert_eq!(socket.state, "01");
+        assert_eq!(socket.inode, 12345);
+    }
+
+    #[test]
+    fn rejects_malformed_proc_tcp_socket() {
+        assert!(parse_tcp_socket("not a tcp record").is_none());
+    }
+
+    #[test]
+    fn selects_only_established_sockets_on_listening_ports() {
+        let sockets = vec![
+            TcpSocket {
+                local_port: 8080,
+                state: "0A".into(),
+                inode: 1,
+            },
+            TcpSocket {
+                local_port: 8080,
+                state: "01".into(),
+                inode: 2,
+            },
+            TcpSocket {
+                local_port: 49152,
+                state: "01".into(),
+                inode: 3,
+            },
+        ];
+        assert_eq!(server_socket_inodes(&sockets), [2].into_iter().collect());
     }
 }
