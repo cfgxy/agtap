@@ -22,9 +22,9 @@ const MAX_RETRY_DELAY_SECS: u64 = 300;
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
 #[serde(rename_all = "lowercase")]
 pub enum ArchiveCompression {
-    /// LZ4 frame, never a raw LZ4 block, so downstream readers can identify it.
-    #[default]
+    /// LZ4 frame is retained as an explicit compatibility option.
     Lz4,
+    #[default]
     Zstd,
 }
 
@@ -155,7 +155,7 @@ impl ArchiveQueue {
     }
 
     pub fn enqueue_rotated(&self, rotated_path: &Path, object_prefix: &str) -> io::Result<()> {
-        self.enqueue_rotated_with_compression(rotated_path, object_prefix, ArchiveCompression::Lz4)
+        self.enqueue_rotated_with_compression(rotated_path, object_prefix, ArchiveCompression::Zstd)
     }
 
     pub fn enqueue_rotated_with_compression(
@@ -303,7 +303,7 @@ impl ArchiveQueue {
     }
 
     pub fn recover_rotations(&self, log_path: &Path, object_prefix: &str) -> io::Result<()> {
-        self.recover_rotations_with_compression(log_path, object_prefix, ArchiveCompression::Lz4)
+        self.recover_rotations_with_compression(log_path, object_prefix, ArchiveCompression::Zstd)
     }
 
     pub fn recover_rotations_with_compression(
@@ -1079,6 +1079,11 @@ mod tests {
     }
 
     #[test]
+    fn default_compression_is_zstd() {
+        assert_eq!(ArchiveCompression::default(), ArchiveCompression::Zstd);
+    }
+
+    #[test]
     fn lz4_frame_and_zstd_round_trip_jsonl() {
         let source = b"{\"body_id\":\"b\"}\n";
         for compression in [ArchiveCompression::Lz4, ArchiveCompression::Zstd] {
@@ -1135,7 +1140,7 @@ mod tests {
     }
 
     #[test]
-    fn rotation_intent_reopens_as_same_lz4_job() {
+    fn rotation_intent_reopens_as_same_zstd_job() {
         let dir = TempDir::new().unwrap();
         let runtime = dir.path().join("runtime");
         let queue = ArchiveQueue::open(&runtime).unwrap();
@@ -1150,11 +1155,11 @@ mod tests {
 
         let reopened = ArchiveQueue::open(&runtime).unwrap();
         reopened
-            .recover_rotations_with_compression(&log, "tenant", ArchiveCompression::Lz4)
+            .recover_rotations_with_compression(&log, "tenant", ArchiveCompression::Zstd)
             .unwrap();
         let job = reopened.load_jobs().pop().unwrap();
         assert_eq!(job.rotation_id.as_deref(), Some(rotation_id.as_str()));
-        assert_eq!(job.compression, ArchiveCompression::Lz4);
+        assert_eq!(job.compression, ArchiveCompression::Zstd);
     }
 
     #[test]

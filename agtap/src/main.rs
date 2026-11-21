@@ -156,8 +156,8 @@ struct Cli {
     #[arg(long, default_value = "us-east-1")]
     archive_s3_region: String,
 
-    /// Compression for archive JSONL parts: lz4 (frame) or zstd.
-    #[arg(long, value_enum, default_value = "lz4")]
+    /// Compression for archive JSONL parts: zstd (default) or explicit lz4 frame.
+    #[arg(long, value_enum, default_value = "zstd")]
     archive_compression: ArchiveCompression,
 
     /// Base delay before retrying a failed archive upload (seconds)
@@ -852,7 +852,7 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{body_retain_bytes, Cli};
+    use super::{body_retain_bytes, ArchiveCompression, Cli};
     use clap::Parser;
 
     #[test]
@@ -868,8 +868,18 @@ mod tests {
     }
 
     #[test]
-    fn archive_compression_rejects_unknown_value() {
+    fn archive_compression_defaults_to_zstd_and_rejects_unknown_value() {
+        let defaults = Cli::try_parse_from(["agtap"]).unwrap();
+        assert_eq!(defaults.archive_compression, ArchiveCompression::Zstd);
         assert!(Cli::try_parse_from(["agtap", "--archive-compression", "brotli"]).is_err());
-        assert!(Cli::try_parse_from(["agtap", "--archive-compression", "zstd"]).is_ok());
+        assert!(Cli::try_parse_from(["agtap", "--archive-compression", "lz4"]).is_ok());
+    }
+
+    #[test]
+    fn archive_docs_use_zstd_and_disclaim_lz4_duckdb_support() {
+        let docs = include_str!("../../docs/s3-archive.md");
+        assert!(docs.contains("--archive-compression zstd"));
+        assert!(docs.contains(".jsonl.zst"));
+        assert!(docs.contains("不承诺"));
     }
 }

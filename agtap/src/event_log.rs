@@ -54,7 +54,7 @@ impl LogWriter {
             max_files: max_files.max(1),
             archive_queue: None,
             archive_prefix: "agtap".to_string(),
-            archive_compression: ArchiveCompression::Lz4,
+            archive_compression: ArchiveCompression::Zstd,
             archive_recovery_needed: false,
         })
     }
