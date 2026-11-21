@@ -12,7 +12,7 @@ use log::{info, warn};
 use tokio::signal;
 use tokio::sync::mpsc;
 
-use agtap::archive::{self, ArchiveConfig, ArchiveQueue};
+use agtap::archive::{self, ArchiveCompression, ArchiveConfig, ArchiveQueue};
 use agtap::body_store::BodyStore;
 use agtap::pipe;
 use agtap::providers::{self, anthropic, gemini, mcp, openai_completions, openai_responses};
@@ -155,6 +155,10 @@ struct Cli {
     /// S3 region (default: us-east-1)
     #[arg(long, default_value = "us-east-1")]
     archive_s3_region: String,
+
+    /// Compression for archive JSONL parts: zstd (default) or explicit lz4 frame.
+    #[arg(long, value_enum, default_value = "zstd")]
+    archive_compression: ArchiveCompression,
 
     /// Base delay before retrying a failed archive upload (seconds)
     #[arg(long, default_value = "5")]
@@ -657,6 +661,7 @@ async fn main() -> anyhow::Result<()> {
             bucket,
             region: cli.archive_s3_region.clone(),
             retry_delay_secs: cli.archive_retry_delay_secs,
+            compression: cli.archive_compression,
         };
         match archive::start(queue.clone(), config).await {
             Ok(handle) => {
@@ -676,7 +681,11 @@ async fn main() -> anyhow::Result<()> {
     let max_log_bytes = cli.max_log_size * 1024 * 1024;
     let mut log_writer = event_log::LogWriter::open(&log_path, max_log_bytes, cli.max_log_files)?;
     if let Some(queue) = archive_queue.clone() {
-        log_writer.set_archive_queue(queue, cli.archive_s3_prefix.clone())?;
+        log_writer.set_archive_queue(
+            queue,
+            cli.archive_s3_prefix.clone(),
+            cli.archive_compression,
+        )?;
     }
     eprintln!("agtap: logging to {}", log_path.display());
 
@@ -843,7 +852,8 @@ async fn main() -> anyhow::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::body_retain_bytes;
+    use super::{body_retain_bytes, ArchiveCompression, Cli};
+    use clap::Parser;
 
     #[test]
     fn body_retain_limit_accepts_supported_go_capture_maximum() {
@@ -855,5 +865,21 @@ mod tests {
         let error = body_retain_bytes(1025).unwrap_err().to_string();
         assert!(error.contains("rejected"));
         assert!(error.contains("1024 KiB"));
+    }
+
+    #[test]
+    fn archive_compression_defaults_to_zstd_and_rejects_unknown_value() {
+        let defaults = Cli::try_parse_from(["agtap"]).unwrap();
+        assert_eq!(defaults.archive_compression, ArchiveCompression::Zstd);
+        assert!(Cli::try_parse_from(["agtap", "--archive-compression", "brotli"]).is_err());
+        assert!(Cli::try_parse_from(["agtap", "--archive-compression", "lz4"]).is_ok());
+    }
+
+    #[test]
+    fn archive_docs_use_zstd_and_disclaim_lz4_duckdb_support() {
+        let docs = include_str!("../../docs/s3-archive.md");
+        assert!(docs.contains("--archive-compression zstd"));
+        assert!(docs.contains(".jsonl.zst"));
+        assert!(docs.contains("不承诺"));
     }
 }

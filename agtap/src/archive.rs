@@ -1,20 +1,65 @@
 use async_trait::async_trait;
 use aws_sdk_s3::primitives::ByteStream;
+use chrono::{Datelike, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::collections::HashSet;
 use std::fs;
-use std::io;
+#[cfg(test)]
+use std::io::Read;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
-const ARCHIVE_FORMAT: &str = "agtap-archive-v1";
+const ARCHIVE_FORMAT: &str = "agtap-hive-jsonl-v1";
 const WORKER_POLL_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_RETRY_DELAY_SECS: u64 = 300;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize, clap::ValueEnum)]
+#[serde(rename_all = "lowercase")]
+pub enum ArchiveCompression {
+    /// LZ4 frame is retained as an explicit compatibility option.
+    Lz4,
+    #[default]
+    Zstd,
+}
+
+impl ArchiveCompression {
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Lz4 => "lz4",
+            Self::Zstd => "zst",
+        }
+    }
+
+    fn compress(self, input: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Lz4 => {
+                let mut encoder = lz4_flex::frame::FrameEncoder::new(Vec::new());
+                encoder.write_all(input)?;
+                encoder.finish().map_err(io::Error::other)
+            }
+            Self::Zstd => zstd::stream::encode_all(input, 0).map_err(io::Error::other),
+        }
+    }
+
+    #[cfg(test)]
+    fn decompress(self, input: &[u8]) -> io::Result<Vec<u8>> {
+        match self {
+            Self::Lz4 => {
+                let mut decoder = lz4_flex::frame::FrameDecoder::new(input);
+                let mut output = Vec::new();
+                decoder.read_to_end(&mut output)?;
+                Ok(output)
+            }
+            Self::Zstd => zstd::stream::decode_all(input).map_err(io::Error::other),
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 pub struct ArchiveConfig {
@@ -22,6 +67,7 @@ pub struct ArchiveConfig {
     pub bucket: String,
     pub region: String,
     pub retry_delay_secs: u64,
+    pub compression: ArchiveCompression,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -32,12 +78,40 @@ struct ArchiveJob {
     source_path: String,
     #[serde(default)]
     rotated_path: Option<String>,
-    payload_path: Option<String>,
+    #[serde(default)]
     body_paths: Vec<String>,
-    object_key: String,
-    payload_sha256: Option<String>,
+    #[serde(default = "default_archive_prefix")]
+    object_prefix: String,
+    #[serde(default)]
+    compression: ArchiveCompression,
+    #[serde(default)]
+    partition_month: String,
+    #[serde(default)]
+    partition_day: String,
+    #[serde(default)]
+    bodies_key: String,
+    #[serde(default)]
+    events_key: String,
+    #[serde(default)]
+    manifest_key: String,
+    #[serde(default)]
+    bodies_payload_path: Option<String>,
+    #[serde(default)]
+    events_payload_path: Option<String>,
+    #[serde(default)]
+    manifest_payload_path: Option<String>,
+    #[serde(default)]
+    bodies_sha256: Option<String>,
+    #[serde(default)]
+    events_sha256: Option<String>,
+    #[serde(default)]
+    manifest_sha256: Option<String>,
     attempts: u32,
     next_attempt_at: u64,
+}
+
+fn default_archive_prefix() -> String {
+    "agtap".to_string()
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -49,19 +123,6 @@ struct RotationIntent {
     source_len: u64,
     source_identity: Option<String>,
     source_sha256: String,
-}
-
-#[derive(Debug, Serialize)]
-struct ArchivePackage {
-    format: &'static str,
-    events: Vec<Value>,
-    bodies: Vec<ArchiveBody>,
-}
-
-#[derive(Debug, Serialize)]
-struct ArchiveBody {
-    path: String,
-    content: Value,
 }
 
 #[derive(Clone)]
@@ -94,13 +155,23 @@ impl ArchiveQueue {
     }
 
     pub fn enqueue_rotated(&self, rotated_path: &Path, object_prefix: &str) -> io::Result<()> {
-        self.enqueue_rotated_with_source(rotated_path, object_prefix, None)
+        self.enqueue_rotated_with_compression(rotated_path, object_prefix, ArchiveCompression::Zstd)
+    }
+
+    pub fn enqueue_rotated_with_compression(
+        &self,
+        rotated_path: &Path,
+        object_prefix: &str,
+        compression: ArchiveCompression,
+    ) -> io::Result<()> {
+        self.enqueue_rotated_with_source(rotated_path, object_prefix, compression, None)
     }
 
     pub(crate) fn enqueue_rotated_with_source(
         &self,
         rotated_path: &Path,
         object_prefix: &str,
+        compression: ArchiveCompression,
         rotated_source: Option<&Path>,
     ) -> io::Result<()> {
         if !rotated_path.is_file() {
@@ -122,7 +193,9 @@ impl ArchiveQueue {
             })?;
         }
 
-        if let Err(err) = self.enqueue_snapshot(&snapshot, object_prefix, None, rotated_source) {
+        if let Err(err) =
+            self.enqueue_snapshot(&snapshot, object_prefix, compression, None, rotated_source)
+        {
             let _ = fs::remove_file(&snapshot);
             return Err(err);
         }
@@ -133,30 +206,41 @@ impl ArchiveQueue {
         &self,
         snapshot: &Path,
         object_prefix: &str,
+        compression: ArchiveCompression,
         rotation_id: Option<&str>,
         rotated_source: Option<&Path>,
     ) -> io::Result<()> {
         let id = unique_id();
-        let object_key = format!("{}/{}.json", object_prefix.trim_matches('/'), id);
         let job = ArchiveJob {
             id: id.clone(),
             rotation_id: rotation_id.map(str::to_owned),
             source_path: snapshot.to_string_lossy().into_owned(),
             rotated_path: rotated_source.map(|path| path.to_string_lossy().into_owned()),
-            payload_path: None,
             body_paths: Vec::new(),
-            object_key,
-            payload_sha256: None,
+            object_prefix: object_prefix.trim_matches('/').to_string(),
+            compression,
+            partition_month: String::new(),
+            partition_day: String::new(),
+            bodies_key: String::new(),
+            events_key: String::new(),
+            manifest_key: String::new(),
+            bodies_payload_path: None,
+            events_payload_path: None,
+            manifest_payload_path: None,
+            bodies_sha256: None,
+            events_sha256: None,
+            manifest_sha256: None,
             attempts: 0,
             next_attempt_at: 0,
         };
         self.save_job(&job)
     }
 
-    pub(crate) fn enqueue_rotation(
+    pub(crate) fn enqueue_rotation_with_compression(
         &self,
         rotation_id: &str,
         object_prefix: &str,
+        compression: ArchiveCompression,
         rotated_source: &Path,
     ) -> io::Result<()> {
         let snapshot = self
@@ -171,6 +255,7 @@ impl ArchiveQueue {
         self.enqueue_snapshot(
             &snapshot,
             object_prefix,
+            compression,
             Some(rotation_id),
             Some(rotated_source),
         )
@@ -218,6 +303,15 @@ impl ArchiveQueue {
     }
 
     pub fn recover_rotations(&self, log_path: &Path, object_prefix: &str) -> io::Result<()> {
+        self.recover_rotations_with_compression(log_path, object_prefix, ArchiveCompression::Zstd)
+    }
+
+    pub fn recover_rotations_with_compression(
+        &self,
+        log_path: &Path,
+        object_prefix: &str,
+        compression: ArchiveCompression,
+    ) -> io::Result<()> {
         let entries = fs::read_dir(&self.pending_dir)?;
         let mut jobs = self.load_jobs();
         let mut intents = Vec::new();
@@ -280,6 +374,7 @@ impl ArchiveQueue {
                 self.enqueue_snapshot(
                     Path::new(&intent.snapshot_path),
                     object_prefix,
+                    compression,
                     Some(&intent.id),
                     Some(Path::new(&intent.rotated_path)),
                 )?;
@@ -290,7 +385,7 @@ impl ArchiveQueue {
 
         for snapshot in orphan_snapshots {
             if snapshot.is_file() {
-                self.enqueue_snapshot(&snapshot, object_prefix, None, None)?;
+                self.enqueue_snapshot(&snapshot, object_prefix, compression, None, None)?;
             }
         }
         Ok(())
@@ -354,7 +449,14 @@ impl ArchiveQueue {
             }
         }
         let _ = fs::remove_file(&job.source_path);
-        if let Some(payload_path) = &job.payload_path {
+        for payload_path in [
+            &job.bodies_payload_path,
+            &job.events_payload_path,
+            &job.manifest_payload_path,
+        ]
+        .into_iter()
+        .flatten()
+        {
             let _ = fs::remove_file(payload_path);
         }
         let _ = fs::remove_file(self.pending_dir.join(format!("{}.json", job.id)));
@@ -397,9 +499,6 @@ impl ArchiveQueue {
             let Ok(intent) = serde_json::from_slice::<RotationIntent>(&bytes) else {
                 continue;
             };
-
-            // The snapshot is the immutable source for recovery. If snapshot creation itself
-            // failed after the intent was persisted, protect the still-active log as well.
             for source in [&intent.snapshot_path, &intent.log_path] {
                 if let Ok(paths) = body_paths_from_log(Path::new(source)) {
                     protected.extend(paths.into_iter().map(PathBuf::from));
@@ -409,34 +508,116 @@ impl ArchiveQueue {
         protected
     }
 
-    fn prepare(&self, mut job: ArchiveJob) -> io::Result<(ArchiveJob, Vec<u8>, String)> {
-        if let (Some(payload_path), Some(digest)) = (&job.payload_path, &job.payload_sha256) {
-            let bytes = fs::read(payload_path)?;
-            let actual_digest = sha256_hex(&bytes);
-            if actual_digest == *digest {
-                return Ok((job, bytes, actual_digest));
-            }
-            log::warn!(
-                "archive payload checksum mismatch; rebuilding (job={}, expected={}, actual={})",
-                job.id,
-                digest,
-                actual_digest
-            );
+    fn prepare(&self, mut job: ArchiveJob) -> io::Result<PreparedArchive> {
+        ensure_layout(&mut job);
+        if let Some(prepared) = self.load_cached(&job)? {
+            return Ok(prepared);
         }
 
-        let (package, body_paths) = package_log(Path::new(&job.source_path))?;
-        let bytes = serde_json::to_vec(&package)
+        let (events_jsonl, bodies_jsonl, body_paths) =
+            tables_from_log(Path::new(&job.source_path))?;
+        let bodies = job.compression.compress(&bodies_jsonl)?;
+        let events = job.compression.compress(&events_jsonl)?;
+        let bodies_digest = sha256_hex(&bodies);
+        let events_digest = sha256_hex(&events);
+
+        let bodies_path =
+            self.write_payload(&job.id, "bodies", job.compression.extension(), &bodies)?;
+        let events_path =
+            self.write_payload(&job.id, "events", job.compression.extension(), &events)?;
+        let manifest_value = serde_json::json!({
+            "format": ARCHIVE_FORMAT,
+            "rotation_id": job.rotation_id.as_deref().unwrap_or(&job.id),
+            "partition": {"m": job.partition_month, "d": job.partition_day},
+            "objects": [
+                {"table": "agtap_bodies", "key": job.bodies_key, "sha256": bodies_digest, "size": bodies.len(), "compression": job.compression.extension()},
+                {"table": "agtap_events", "key": job.events_key, "sha256": events_digest, "size": events.len(), "compression": job.compression.extension()}
+            ]
+        });
+        let manifest = serde_json::to_vec(&manifest_value)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        let digest = sha256_hex(&bytes);
-        let payload_path = self.payload_dir.join(format!("{}.json", job.id));
-        let temp = self.payload_dir.join(format!("{}.json.tmp", job.id));
-        fs::write(&temp, &bytes)?;
-        fs::rename(temp, &payload_path)?;
-        job.payload_path = Some(payload_path.to_string_lossy().into_owned());
+        let manifest_digest = sha256_hex(&manifest);
+        let manifest_path = self.write_payload(&job.id, "manifest", "json", &manifest)?;
+
         job.body_paths = body_paths;
-        job.payload_sha256 = Some(digest.clone());
+        job.bodies_payload_path = Some(bodies_path.to_string_lossy().into_owned());
+        job.events_payload_path = Some(events_path.to_string_lossy().into_owned());
+        job.manifest_payload_path = Some(manifest_path.to_string_lossy().into_owned());
+        job.bodies_sha256 = Some(bodies_digest.clone());
+        job.events_sha256 = Some(events_digest.clone());
+        job.manifest_sha256 = Some(manifest_digest.clone());
         self.save_job(&job)?;
-        Ok((job, bytes, digest))
+
+        let bodies_key = job.bodies_key.clone();
+        let events_key = job.events_key.clone();
+        let manifest_key = job.manifest_key.clone();
+        Ok(PreparedArchive {
+            job,
+            bodies: ArchiveObject {
+                key: bodies_key,
+                bytes: bodies,
+                digest: bodies_digest,
+            },
+            events: ArchiveObject {
+                key: events_key,
+                bytes: events,
+                digest: events_digest,
+            },
+            manifest: ArchiveObject {
+                key: manifest_key,
+                bytes: manifest,
+                digest: manifest_digest,
+            },
+        })
+    }
+
+    fn write_payload(
+        &self,
+        id: &str,
+        kind: &str,
+        extension: &str,
+        bytes: &[u8],
+    ) -> io::Result<PathBuf> {
+        let path = self.payload_dir.join(format!("{id}.{kind}.{extension}"));
+        let temp = self
+            .payload_dir
+            .join(format!("{id}.{kind}.{extension}.tmp"));
+        fs::write(&temp, bytes)?;
+        fs::rename(temp, &path)?;
+        Ok(path)
+    }
+
+    fn load_cached(&self, job: &ArchiveJob) -> io::Result<Option<PreparedArchive>> {
+        let Some(bodies) = load_object(
+            &job.bodies_payload_path,
+            &job.bodies_sha256,
+            &job.bodies_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(events) = load_object(
+            &job.events_payload_path,
+            &job.events_sha256,
+            &job.events_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        let Some(manifest) = load_object(
+            &job.manifest_payload_path,
+            &job.manifest_sha256,
+            &job.manifest_key,
+        )?
+        else {
+            return Ok(None);
+        };
+        Ok(Some(PreparedArchive {
+            job: job.clone(),
+            bodies,
+            events,
+            manifest,
+        }))
     }
 }
 
@@ -551,65 +732,181 @@ async fn run_worker(
 
         let now = unix_secs();
         for job in queue.load_jobs() {
-            if job.next_attempt_at > now {
-                continue;
-            }
-            let Some(current) = queue.load_job(&job.id) else {
-                continue;
-            };
-            let (prepared, bytes, digest) = match queue.prepare(current) {
-                Ok(value) => value,
-                Err(_) => {
-                    queue.mark_retry(job, retry_delay_secs);
-                    continue;
-                }
-            };
-            if uploader
-                .upload(&prepared.object_key, bytes, &digest)
-                .await
-                .is_ok()
-            {
-                queue.complete(&prepared);
-            } else {
-                queue.mark_retry(prepared, retry_delay_secs);
+            if job.next_attempt_at <= now {
+                process_job(&queue, uploader.as_ref(), job, retry_delay_secs).await;
             }
         }
     }
 }
 
-fn package_log(path: &Path) -> io::Result<(ArchivePackage, Vec<String>)> {
+async fn process_job(
+    queue: &ArchiveQueue,
+    uploader: &dyn ArchiveUploader,
+    job: ArchiveJob,
+    retry_delay_secs: u64,
+) {
+    let Some(current) = queue.load_job(&job.id) else {
+        return;
+    };
+    let prepared = match queue.prepare(current) {
+        Ok(value) => value,
+        Err(_) => {
+            queue.mark_retry(job, retry_delay_secs);
+            return;
+        }
+    };
+    // These keys are immutable per rotation. The manifest is deliberately the
+    // final commit marker: cleanup is impossible until all three individually
+    // head-verified uploads succeed.
+    let uploaded = if let Err(err) = uploader
+        .upload(
+            &prepared.bodies.key,
+            prepared.bodies.bytes,
+            &prepared.bodies.digest,
+        )
+        .await
+    {
+        Err(err)
+    } else if let Err(err) = uploader
+        .upload(
+            &prepared.events.key,
+            prepared.events.bytes,
+            &prepared.events.digest,
+        )
+        .await
+    {
+        Err(err)
+    } else {
+        uploader
+            .upload(
+                &prepared.manifest.key,
+                prepared.manifest.bytes,
+                &prepared.manifest.digest,
+            )
+            .await
+    };
+    if uploaded.is_ok() {
+        queue.complete(&prepared.job);
+    } else {
+        queue.mark_retry(prepared.job, retry_delay_secs);
+    }
+}
+
+struct ArchiveObject {
+    key: String,
+    bytes: Vec<u8>,
+    digest: String,
+}
+
+struct PreparedArchive {
+    job: ArchiveJob,
+    bodies: ArchiveObject,
+    events: ArchiveObject,
+    manifest: ArchiveObject,
+}
+
+fn ensure_layout(job: &mut ArchiveJob) {
+    if job.partition_month.is_empty() || job.partition_day.is_empty() {
+        let now = Utc::now();
+        job.partition_month = format!("{:04}{:02}", now.year(), now.month());
+        job.partition_day = format!("{:02}", now.day());
+    }
+    let rotation_id = job.rotation_id.as_deref().unwrap_or(&job.id);
+    let prefix = job.object_prefix.trim_matches('/');
+    let partition = format!("m={}/d={}", job.partition_month, job.partition_day);
+    let codec = job.compression.extension();
+    if job.bodies_key.is_empty() {
+        job.bodies_key =
+            format!("{prefix}/agtap_bodies/{partition}/part-{rotation_id}.jsonl.{codec}");
+    }
+    if job.events_key.is_empty() {
+        job.events_key =
+            format!("{prefix}/agtap_events/{partition}/part-{rotation_id}.jsonl.{codec}");
+    }
+    if job.manifest_key.is_empty() {
+        job.manifest_key =
+            format!("{prefix}/agtap_manifests/{partition}/commit-{rotation_id}.json");
+    }
+}
+
+fn load_object(
+    path: &Option<String>,
+    digest: &Option<String>,
+    key: &str,
+) -> io::Result<Option<ArchiveObject>> {
+    let (Some(path), Some(digest)) = (path, digest) else {
+        return Ok(None);
+    };
+    let bytes = match fs::read(path) {
+        Ok(bytes) if sha256_hex(&bytes) == *digest => bytes,
+        Ok(_) => return Ok(None),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err),
+    };
+    Ok(Some(ArchiveObject {
+        key: key.to_string(),
+        bytes,
+        digest: digest.clone(),
+    }))
+}
+
+fn tables_from_log(path: &Path) -> io::Result<(Vec<u8>, Vec<u8>, Vec<String>)> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     let mut bodies = Vec::new();
     let mut body_paths = Vec::new();
-    let mut seen = HashSet::new();
+    let mut body_ids: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    let mut emitted_body_ids = HashSet::new();
 
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
-        let event: Value = serde_json::from_str(line)
+        let mut event: Value = serde_json::from_str(line)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        if let Some(body_path) = event.get("body_path").and_then(Value::as_str) {
-            if seen.insert(body_path.to_string()) {
-                let body_bytes = fs::read(body_path)?;
-                let content: Value = serde_json::from_slice(&body_bytes)
+        let body_id = if let Some(body_path) = event.get("body_path").and_then(Value::as_str) {
+            let body_path = body_path.to_string();
+            if let Some(id) = body_ids.get(&body_path) {
+                id.clone()
+            } else {
+                let bytes = fs::read(&body_path)?;
+                let detail: Value = serde_json::from_slice(&bytes)
                     .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-                bodies.push(ArchiveBody {
-                    path: body_path.to_string(),
-                    content,
+                let id = sha256_hex(&bytes);
+                let row = serde_json::json!({
+                    "body_id": id,
+                    "request": detail.get("request_body").cloned().unwrap_or(Value::Null),
+                    "response": detail.get("response_body").cloned().unwrap_or(Value::Null),
                 });
-                body_paths.push(body_path.to_string());
+                if emitted_body_ids.insert(id.clone()) {
+                    append_jsonl(&mut bodies, &row)?;
+                }
+                body_paths.push(body_path.clone());
+                body_ids.insert(body_path, id.clone());
+                id
             }
-        }
-        events.push(event);
+        } else {
+            String::new()
+        };
+        let object = event.as_object_mut().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "event is not a JSON object")
+        })?;
+        object.remove("body_path");
+        object.insert(
+            "body_id".to_string(),
+            if body_id.is_empty() {
+                Value::Null
+            } else {
+                Value::String(body_id)
+            },
+        );
+        append_jsonl(&mut events, &event)?;
     }
+    Ok((events, bodies, body_paths))
+}
 
-    Ok((
-        ArchivePackage {
-            format: ARCHIVE_FORMAT,
-            events,
-            bodies,
-        },
-        body_paths,
-    ))
+fn append_jsonl(output: &mut Vec<u8>, row: &Value) -> io::Result<()> {
+    serde_json::to_writer(&mut *output, row)
+        .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+    output.push(b'\n');
+    Ok(())
 }
 
 fn body_paths_from_log(path: &Path) -> io::Result<Vec<String>> {
@@ -691,87 +988,178 @@ fn unique_id() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
     use tempfile::TempDir;
 
-    struct FailingUploader {
-        calls: AtomicUsize,
+    struct RecordingUploader {
+        keys: Mutex<Vec<String>>,
+        fail_key: Option<&'static str>,
     }
 
     #[async_trait]
-    impl ArchiveUploader for FailingUploader {
-        async fn upload(&self, _key: &str, _bytes: Vec<u8>, _digest: &str) -> Result<(), String> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
-            Err("test upload failure".to_string())
-        }
-    }
-
-    struct VerifyingUploader {
-        calls: AtomicUsize,
-        failures_remaining: AtomicUsize,
-        uploaded: Mutex<Vec<u8>>,
-    }
-
-    #[async_trait]
-    impl ArchiveUploader for VerifyingUploader {
-        async fn upload(&self, _key: &str, bytes: Vec<u8>, digest: &str) -> Result<(), String> {
-            self.calls.fetch_add(1, Ordering::Relaxed);
+    impl ArchiveUploader for RecordingUploader {
+        async fn upload(&self, key: &str, bytes: Vec<u8>, digest: &str) -> Result<(), String> {
             if sha256_hex(&bytes) != digest {
-                return Err("test checksum verification failed".to_string());
+                return Err("checksum mismatch".to_string());
             }
-            if self
-                .failures_remaining
-                .try_update(Ordering::Relaxed, Ordering::Relaxed, |remaining| {
-                    if remaining > 0 {
-                        Some(remaining - 1)
-                    } else {
-                        None
-                    }
-                })
-                .is_ok()
-            {
-                return Err("test transient upload failure".to_string());
+            self.keys.lock().unwrap().push(key.to_string());
+            if self.fail_key.is_some_and(|expected| key.contains(expected)) {
+                return Err("forced object verification failure".to_string());
             }
-            *self.uploaded.lock().unwrap() = bytes;
             Ok(())
         }
     }
 
-    #[test]
-    fn queue_keeps_rotated_snapshot_and_protects_body() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
+    fn fixture(
+        queue: &ArchiveQueue,
+        dir: &TempDir,
+        compression: ArchiveCompression,
+    ) -> (PathBuf, PathBuf) {
         let body = dir.path().join("body.json");
-        fs::write(&body, br#"{"request_body":"hello"}"#).unwrap();
+        fs::write(
+            &body,
+            br#"{"request_body":"hello","response_body":"world","request_path":"/v1/chat/completions"}"#,
+        )
+        .unwrap();
         let log = dir.path().join("events.jsonl.1");
-        let event = format!(r#"{{"id":"e1","body_path":"{}"}}"#, body.display()) + "\n";
-        fs::write(&log, event).unwrap();
-
-        queue.enqueue_rotated(&log, "tests").unwrap();
-        let protected = queue.protected_body_paths(None);
-        assert!(protected.contains(&body));
-        assert_eq!(queue.load_jobs().len(), 1);
-        assert!(queue.closed_dir.read_dir().unwrap().next().is_some());
+        fs::write(
+            &log,
+            format!(
+                "{{\"id\":\"e1\",\"model\":\"m\",\"body_path\":\"{}\"}}\n{{\"id\":\"e2\",\"model\":\"m\"}}\n",
+                body.display()
+            ),
+        )
+        .unwrap();
+        queue
+            .enqueue_rotated_with_compression(&log, "tenant", compression)
+            .unwrap();
+        (log, body)
     }
 
     #[test]
-    fn package_contains_events_and_bodies() {
+    fn jsonl_parts_have_partitioned_paths_and_body_id_join() {
         let dir = TempDir::new().unwrap();
-        let body = dir.path().join("body.json");
-        fs::write(&body, br#"{"request_body":"hello"}"#).unwrap();
-        let log = dir.path().join("events.jsonl");
-        fs::write(
-            &log,
-            format!(r#"{{"id":"e1","body_path":"{}"}}"#, body.display()) + "\n",
+        let queue = ArchiveQueue::open(&dir.path().join("runtime")).unwrap();
+        let (_, body_path) = fixture(&queue, &dir, ArchiveCompression::Lz4);
+        let prepared = queue.prepare(queue.load_jobs().pop().unwrap()).unwrap();
+
+        assert!(prepared.events.key.starts_with("tenant/agtap_events/m="));
+        assert!(prepared.events.key.contains("/d="));
+        assert!(prepared.events.key.ends_with(".jsonl.lz4"));
+        assert!(prepared.bodies.key.starts_with("tenant/agtap_bodies/m="));
+        assert!(prepared
+            .manifest
+            .key
+            .starts_with("tenant/agtap_manifests/m="));
+        assert!(prepared.manifest.key.ends_with(".json"));
+
+        let events = String::from_utf8(
+            ArchiveCompression::Lz4
+                .decompress(&prepared.events.bytes)
+                .unwrap(),
         )
         .unwrap();
-        let (package, paths) = package_log(&log).unwrap();
-        assert_eq!(package.format, ARCHIVE_FORMAT);
-        assert_eq!(package.events.len(), 1);
-        assert_eq!(package.bodies.len(), 1);
-        assert_eq!(paths, vec![body.to_string_lossy().to_string()]);
+        let bodies = String::from_utf8(
+            ArchiveCompression::Lz4
+                .decompress(&prepared.bodies.bytes)
+                .unwrap(),
+        )
+        .unwrap();
+        let event_lines = events.lines().collect::<Vec<_>>();
+        let body_lines = bodies.lines().collect::<Vec<_>>();
+        assert_eq!(event_lines.len(), 2);
+        assert_eq!(body_lines.len(), 1);
+        let event: Value = serde_json::from_str(event_lines[0]).unwrap();
+        let body: Value = serde_json::from_str(body_lines[0]).unwrap();
+        assert_eq!(event["body_id"], body["body_id"]);
+        assert!(event.get("body_path").is_none());
+        assert_eq!(body["request"], "hello");
+        assert_eq!(body["response"], "world");
+        assert!(body_path.exists());
+    }
+
+    #[test]
+    fn default_compression_is_zstd() {
+        assert_eq!(ArchiveCompression::default(), ArchiveCompression::Zstd);
+    }
+
+    #[test]
+    fn lz4_frame_and_zstd_round_trip_jsonl() {
+        let source = b"{\"body_id\":\"b\"}\n";
+        for compression in [ArchiveCompression::Lz4, ArchiveCompression::Zstd] {
+            let encoded = compression.compress(source).unwrap();
+            assert_eq!(compression.decompress(&encoded).unwrap(), source);
+        }
+        // LZ4 frame magic, not a raw LZ4 block.
+        assert_eq!(
+            ArchiveCompression::Lz4.compress(source).unwrap()[..4],
+            [0x04, 0x22, 0x4d, 0x18]
+        );
+    }
+
+    #[tokio::test]
+    async fn manifest_is_last_and_failed_verification_keeps_job_for_restart() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let (_, body) = fixture(&queue, &dir, ArchiveCompression::Zstd);
+        let job = queue.load_jobs().pop().unwrap();
+        let failing = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: Some("agtap_manifests/"),
+        };
+        process_job(&queue, &failing, job, 1).await;
+        assert_eq!(queue.pending_count(), 1);
+        assert!(body.exists());
+        let queued = queue.load_jobs().pop().unwrap();
+        assert!(Path::new(&queued.source_path).exists());
+        assert!(queued
+            .bodies_payload_path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).exists()));
+        let failed_keys = failing.keys.lock().unwrap().clone();
+        assert_eq!(failed_keys.len(), 3);
+        assert!(failed_keys[0].contains("agtap_bodies/"));
+        assert!(failed_keys[1].contains("agtap_events/"));
+        assert!(failed_keys[2].contains("agtap_manifests/"));
+
+        let reopened = ArchiveQueue::open(&runtime).unwrap();
+        let job = reopened.load_jobs().pop().unwrap();
+        let succeeding = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: None,
+        };
+        process_job(&reopened, &succeeding, job, 1).await;
+        assert_eq!(reopened.pending_count(), 0);
+        assert!(!body.exists());
+        let keys = succeeding.keys.lock().unwrap();
+        assert_eq!(keys.len(), 3);
+        assert!(keys[0].contains("agtap_bodies/"));
+        assert!(keys[1].contains("agtap_events/"));
+        assert!(keys[2].contains("agtap_manifests/"));
+    }
+
+    #[test]
+    fn rotation_intent_reopens_as_same_zstd_job() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let log = dir.path().join("events.jsonl");
+        let rotated = dir.path().join("events.jsonl.1");
+        fs::write(&log, "{\"id\":\"e1\"}\n").unwrap();
+        let rotation_id = queue
+            .begin_rotation(&log, fs::metadata(&log).unwrap().len())
+            .unwrap();
+        fs::rename(&log, &rotated).unwrap();
+        drop(queue);
+
+        let reopened = ArchiveQueue::open(&runtime).unwrap();
+        reopened
+            .recover_rotations_with_compression(&log, "tenant", ArchiveCompression::Zstd)
+            .unwrap();
+        let job = reopened.load_jobs().pop().unwrap();
+        assert_eq!(job.rotation_id.as_deref(), Some(rotation_id.as_str()));
+        assert_eq!(job.compression, ArchiveCompression::Zstd);
     }
 
     #[test]
@@ -779,245 +1167,9 @@ mod tests {
         let dir = TempDir::new().unwrap();
         let runtime = dir.path().join("runtime");
         let queue = ArchiveQueue::open(&runtime).unwrap();
-        let log = dir.path().join("events.jsonl.1");
-        fs::write(&log, "{\"id\":\"e1\"}\n").unwrap();
-        queue.enqueue_rotated(&log, "tests").unwrap();
+        fixture(&queue, &dir, ArchiveCompression::Lz4);
         assert_eq!(queue.pending_count(), 1);
-
         let reopened = ArchiveQueue::open(&runtime).unwrap();
         assert_eq!(reopened.pending_count(), 1);
-        assert_eq!(reopened.protected_body_paths(None).len(), 0);
-    }
-
-    #[test]
-    fn rotation_intent_recovers_after_restart() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let log = dir.path().join("events.jsonl");
-        let rotated = dir.path().join("events.jsonl.1");
-        fs::write(&log, "{\"id\":\"e1\"}\n").unwrap();
-        let source_len = fs::metadata(&log).unwrap().len();
-        let intent_id = queue.begin_rotation(&log, source_len).unwrap();
-        fs::rename(&log, &rotated).unwrap();
-        drop(queue);
-
-        let reopened = ArchiveQueue::open(&runtime).unwrap();
-        reopened.recover_rotations(&log, "tests").unwrap();
-
-        assert_eq!(reopened.pending_count(), 1);
-        assert!(
-            reopened
-                .pending_dir
-                .join(format!(".rotation-{intent_id}.json"))
-                .exists()
-                == false
-        );
-        assert!(reopened.closed_dir.read_dir().unwrap().next().is_some());
-    }
-
-    #[test]
-    fn orphan_snapshot_is_requeued_after_restart() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let snapshot = queue.closed_dir.join("orphan.jsonl");
-        fs::write(&snapshot, "{\"id\":\"orphan\"}\n").unwrap();
-
-        queue
-            .recover_rotations(&dir.path().join("events.jsonl"), "tests")
-            .unwrap();
-
-        let jobs = queue.load_jobs();
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].source_path, snapshot.to_string_lossy());
-    }
-
-    #[test]
-    fn rotation_recovery_uses_intent_snapshot_not_same_length_orphan() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let log = dir.path().join("events.jsonl");
-        let rotated = dir.path().join("events.jsonl.1");
-        let current_contents = "{\"id\":\"new\"}\n";
-        let stale_contents = "{\"id\":\"old\"}\n";
-        assert_eq!(current_contents.len(), stale_contents.len());
-        fs::write(&log, current_contents).unwrap();
-        let source_len = fs::metadata(&log).unwrap().len();
-        let rotation_id = queue.begin_rotation(&log, source_len).unwrap();
-        let stable_snapshot = queue
-            .closed_dir
-            .join(format!("rotation-{rotation_id}.jsonl"));
-        fs::rename(&log, &rotated).unwrap();
-        let orphan = queue.closed_dir.join("orphan.jsonl");
-        fs::write(&orphan, stale_contents).unwrap();
-
-        queue.recover_rotations(&log, "tests").unwrap();
-
-        let jobs = queue.load_jobs();
-        let rotation_job = jobs
-            .iter()
-            .find(|job| job.rotation_id.as_deref() == Some(rotation_id.as_str()))
-            .unwrap();
-        assert_eq!(jobs.len(), 2);
-        assert_eq!(rotation_job.source_path, stable_snapshot.to_string_lossy());
-        assert_eq!(
-            fs::read_to_string(&rotation_job.source_path).unwrap(),
-            current_contents
-        );
-        assert_eq!(
-            rotation_job.rotated_path.as_deref(),
-            Some(rotated.to_str().unwrap())
-        );
-    }
-
-    #[test]
-    fn rotation_recovery_keeps_distinct_intents_after_rotated_path_reuse() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let log = dir.path().join("events.jsonl");
-        let first_rotated = dir.path().join("events.jsonl.1");
-        let second_rotated = dir.path().join("events.jsonl.2");
-
-        fs::write(&log, "{\"id\":\"first\"}\n").unwrap();
-        let first_len = fs::metadata(&log).unwrap().len();
-        let first_id = queue.begin_rotation(&log, first_len).unwrap();
-        fs::rename(&log, &first_rotated).unwrap();
-        queue
-            .enqueue_rotation(&first_id, "tests", &first_rotated)
-            .unwrap();
-
-        fs::rename(&first_rotated, &second_rotated).unwrap();
-        fs::write(&log, "{\"id\":\"second\"}\n").unwrap();
-        let second_len = fs::metadata(&log).unwrap().len();
-        let second_id = queue.begin_rotation(&log, second_len).unwrap();
-        let second_snapshot = queue.closed_dir.join(format!("rotation-{second_id}.jsonl"));
-        fs::rename(&log, &first_rotated).unwrap();
-
-        queue.recover_rotations(&log, "tests").unwrap();
-
-        let jobs = queue.load_jobs();
-        assert_eq!(jobs.len(), 2);
-        assert!(jobs
-            .iter()
-            .any(|job| job.rotation_id.as_deref() == Some(first_id.as_str())));
-        let second_job = jobs
-            .iter()
-            .find(|job| job.rotation_id.as_deref() == Some(second_id.as_str()))
-            .unwrap();
-        assert_eq!(second_job.source_path, second_snapshot.to_string_lossy());
-        assert_eq!(
-            fs::read_to_string(&second_job.source_path).unwrap(),
-            "{\"id\":\"second\"}\n"
-        );
-    }
-
-    #[test]
-    fn corrupt_payload_is_rebuilt_before_upload() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let log = dir.path().join("events.jsonl.1");
-        fs::write(&log, "{\"id\":\"e1\"}\n").unwrap();
-        queue.enqueue_rotated(&log, "tests").unwrap();
-
-        let job = queue.load_jobs().pop().unwrap();
-        let (prepared, original, digest) = queue.prepare(job).unwrap();
-        let payload_path = prepared.payload_path.clone().unwrap();
-        let corrupted = vec![0u8; original.len()];
-        fs::write(&payload_path, &corrupted).unwrap();
-
-        let (rebuilt_job, rebuilt, rebuilt_digest) = queue.prepare(prepared).unwrap();
-        assert_eq!(rebuilt.len(), corrupted.len());
-        assert_ne!(rebuilt, corrupted);
-        assert_eq!(rebuilt_digest, sha256_hex(&rebuilt));
-        assert_eq!(rebuilt_digest, digest);
-        assert_eq!(
-            rebuilt_job.payload_path.as_deref(),
-            Some(payload_path.as_str())
-        );
-    }
-
-    #[tokio::test]
-    async fn worker_keeps_failed_job_for_retry() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = Arc::new(ArchiveQueue::open(&runtime).unwrap());
-        let log = dir.path().join("events.jsonl.1");
-        fs::write(&log, "{\"id\":\"e1\"}\n").unwrap();
-        queue.enqueue_rotated(&log, "tests").unwrap();
-
-        let uploader = Arc::new(FailingUploader {
-            calls: AtomicUsize::new(0),
-        });
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let worker = tokio::spawn(run_worker(queue.clone(), uploader.clone(), 60, stop_rx));
-        tokio::time::sleep(Duration::from_millis(1200)).await;
-        let _ = stop_tx.send(());
-        worker.await.unwrap();
-
-        let jobs = queue.load_jobs();
-        assert_eq!(uploader.calls.load(Ordering::Relaxed), 1);
-        assert_eq!(jobs.len(), 1);
-        assert_eq!(jobs[0].attempts, 1);
-        assert!(jobs[0].next_attempt_at > unix_secs());
-    }
-
-    #[tokio::test]
-    async fn worker_upload_retry_verifies_and_cleans_successfully() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = Arc::new(ArchiveQueue::open(&runtime).unwrap());
-        let body = dir.path().join("body.json");
-        fs::write(&body, br#"{"request_body":"hello"}"#).unwrap();
-        let log = dir.path().join("events.jsonl.1");
-        let event = format!(r#"{{"id":"e1","body_path":"{}"}}"#, body.display()) + "\n";
-        fs::write(&log, event).unwrap();
-        queue.enqueue_rotated(&log, "tests").unwrap();
-
-        let uploader = Arc::new(VerifyingUploader {
-            calls: AtomicUsize::new(0),
-            failures_remaining: AtomicUsize::new(1),
-            uploaded: Mutex::new(Vec::new()),
-        });
-        let (stop_tx, stop_rx) = oneshot::channel();
-        let worker = tokio::spawn(run_worker(queue.clone(), uploader.clone(), 1, stop_rx));
-        tokio::time::sleep(Duration::from_secs(4)).await;
-        let _ = stop_tx.send(());
-        worker.await.unwrap();
-
-        assert!(uploader.calls.load(Ordering::Relaxed) >= 2);
-        assert!(!uploader.uploaded.lock().unwrap().is_empty());
-        assert_eq!(queue.pending_count(), 0);
-        assert!(!body.exists());
-    }
-
-    #[test]
-    fn successful_completion_removes_payload_and_body() {
-        let dir = TempDir::new().unwrap();
-        let runtime = dir.path().join("runtime");
-        let queue = ArchiveQueue::open(&runtime).unwrap();
-        let body = dir.path().join("body.json");
-        fs::write(&body, br#"{"request_body":"hello"}"#).unwrap();
-        let log = dir.path().join("events.jsonl.1");
-        let event = format!(r#"{{"id":"e1","body_path":"{}"}}"#, body.display()) + "\n";
-        fs::write(&log, event).unwrap();
-        queue.enqueue_rotated(&log, "tests").unwrap();
-
-        let job = queue.load_jobs().pop().unwrap();
-        let (prepared, bytes, digest) = queue.prepare(job).unwrap();
-        assert!(!bytes.is_empty());
-        assert_eq!(sha256_hex(&bytes), digest);
-        let payload_path = prepared.payload_path.clone().unwrap();
-        assert!(Path::new(&payload_path).exists());
-
-        queue.complete(&prepared);
-
-        assert_eq!(queue.pending_count(), 0);
-        assert!(!Path::new(&prepared.source_path).exists());
-        assert!(!Path::new(&payload_path).exists());
-        assert!(!body.exists());
     }
 }

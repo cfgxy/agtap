@@ -106,6 +106,7 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 | `--archive-s3-bucket <BUCKET>` | Enable asynchronous archive uploads to this bucket |
 | `--archive-s3-prefix <PREFIX>` | Object key prefix (default: `agtap`) |
 | `--archive-s3-region <REGION>` | S3 signing region (default: `us-east-1`) |
+| `--archive-compression <zstd|lz4>` | Archive JSONL part codec (default: Zstd; DuckDB JSON S3 direct-read validated for `.zst`; LZ4 frame is explicit only) |
 | `--archive-retry-delay-secs <SECONDS>` | Base delay for failed archive retries (default: 5) |
 
 For a selected `--pid`/`--comm` target, agtap refuses to start if the Go direct-syscall tracepoint programs cannot load and attach. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.

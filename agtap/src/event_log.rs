@@ -3,7 +3,7 @@ use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use crate::archive::ArchiveQueue;
+use crate::archive::{ArchiveCompression, ArchiveQueue};
 use crate::output::AgentEvent;
 
 pub struct LogWriter {
@@ -14,6 +14,7 @@ pub struct LogWriter {
     max_files: usize,
     archive_queue: Option<Arc<ArchiveQueue>>,
     archive_prefix: String,
+    archive_compression: ArchiveCompression,
     archive_recovery_needed: bool,
 }
 
@@ -53,6 +54,7 @@ impl LogWriter {
             max_files: max_files.max(1),
             archive_queue: None,
             archive_prefix: "agtap".to_string(),
+            archive_compression: ArchiveCompression::Zstd,
             archive_recovery_needed: false,
         })
     }
@@ -61,10 +63,12 @@ impl LogWriter {
         &mut self,
         queue: Arc<ArchiveQueue>,
         prefix: String,
+        compression: ArchiveCompression,
     ) -> anyhow::Result<()> {
-        queue.recover_rotations(&self.log_path, &prefix)?;
+        queue.recover_rotations_with_compression(&self.log_path, &prefix, compression)?;
         self.archive_queue = Some(queue);
         self.archive_prefix = prefix;
+        self.archive_compression = compression;
         self.archive_recovery_needed = false;
         Ok(())
     }
@@ -72,7 +76,11 @@ impl LogWriter {
     pub fn write_event(&mut self, event: &AgentEvent) {
         if self.archive_recovery_needed {
             if let Some(queue) = &self.archive_queue {
-                match queue.recover_rotations(&self.log_path, &self.archive_prefix) {
+                match queue.recover_rotations_with_compression(
+                    &self.log_path,
+                    &self.archive_prefix,
+                    self.archive_compression,
+                ) {
                     Ok(()) => self.archive_recovery_needed = false,
                     Err(err) => {
                         eprintln!("agtap: archive rotation recovery failed: {err}");
@@ -131,7 +139,12 @@ impl LogWriter {
         if let Some(queue) = &self.archive_queue {
             if let Some(rotation_id) = rotation_id {
                 queue
-                    .enqueue_rotation(&rotation_id, &self.archive_prefix, &first_rotated)
+                    .enqueue_rotation_with_compression(
+                        &rotation_id,
+                        &self.archive_prefix,
+                        self.archive_compression,
+                        &first_rotated,
+                    )
                     .map_err(|err| anyhow::anyhow!("persist archive job: {err}"))?;
                 queue.complete_rotation(&rotation_id)?;
             }
@@ -311,7 +324,7 @@ mod tests {
         let queue = Arc::new(ArchiveQueue::open(dir.path()).unwrap());
         let mut writer = LogWriter::open(&log_path, 50, 2).unwrap();
         writer
-            .set_archive_queue(queue.clone(), "tests".to_string())
+            .set_archive_queue(queue.clone(), "tests".to_string(), ArchiveCompression::Lz4)
             .unwrap();
 
         for _ in 0..30 {
