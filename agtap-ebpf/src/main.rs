@@ -13,6 +13,7 @@ use agtap_common::{
     MAX_SYSCALL_CAPTURE_SIZE, TCP_CLOSE_FLAG, TCP_FLAG,
 };
 use aya_ebpf::{
+    bindings::BPF_RB_FORCE_WAKEUP,
     helpers::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_buf,
@@ -264,6 +265,7 @@ fn emit_tcp_event_chunk(
     len: u32,
     direction: u32,
     filter_tls_record: bool,
+    force_wakeup: bool,
 ) -> Result<(), u32> {
     // `len` is always bounded to MAX_EVENT_DATA_SIZE by the caller, which keeps the
     // ring-buffer reservation and verifier-visible slice bounded.
@@ -301,7 +303,11 @@ fn emit_tcp_event_chunk(
             let dst = &mut (&mut (*event).data)[..safe_len];
             let _ = bpf_probe_read_user_buf(buf_ptr as *const u8, dst);
         }
-        entry.submit(0);
+        entry.submit(if force_wakeup {
+            BPF_RB_FORCE_WAKEUP as u64
+        } else {
+            0
+        });
     }
     Ok(())
 }
@@ -312,7 +318,7 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
     } else {
         len
     };
-    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, true)
+    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, true, false)
 }
 
 const MAX_GO_SYSCALL_CHUNKS: u32 =
@@ -343,6 +349,7 @@ fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result
             chunk_len,
             direction,
             chunk_index == 0,
+            true,
         )?;
         remaining -= chunk_len;
         offset += chunk_len;

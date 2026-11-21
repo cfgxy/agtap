@@ -146,6 +146,18 @@ impl Reassembler {
         }
 
         if direction == 0 {
+            // A keep-alive upstream socket can carry an unrelated request before
+            // an LLM call. Once a complete request was parsed, a new HTTP request
+            // line starts a fresh exchange on the same fd.
+            let starts_new_request = self.streams.get(&key).is_some_and(|conn| {
+                conn.parsed_request.is_some() && Self::is_http_request_start(data)
+            });
+            if starts_new_request {
+                let comm = self.streams.get(&key).unwrap().comm.clone();
+                self.streams.insert(key, ConnState::new());
+                self.streams.get_mut(&key).unwrap().comm = comm;
+            }
+            let conn = self.streams.get_mut(&key).unwrap();
             // Write (request)
             if conn.req_start_ns.is_none() {
                 conn.req_start_ns = Some(timestamp_ns);
@@ -188,6 +200,25 @@ impl Reassembler {
                 None
             }
         }
+    }
+
+    fn is_openai_path(path: &str) -> bool {
+        let path = path.split('?').next().unwrap_or(path).trim_end_matches('/');
+        path.ends_with("/v1/chat/completions") || path.ends_with("/v1/responses")
+    }
+
+    fn is_http_request_start(data: &[u8]) -> bool {
+        [
+            b"POST ".as_slice(),
+            b"GET ",
+            b"PUT ",
+            b"PATCH ",
+            b"DELETE ",
+            b"HEAD ",
+            b"OPTIONS ",
+        ]
+        .iter()
+        .any(|method| data.starts_with(method))
     }
 
     fn try_parse_request(&mut self, key: (u32, u64)) {
@@ -235,8 +266,7 @@ impl Reassembler {
                     || path.contains(":streamGenerateContent")
                 {
                     Some(ApiKind::Gemini)
-                } else if path.ends_with("/v1/chat/completions") || path.ends_with("/v1/responses")
-                {
+                } else if Self::is_openai_path(&path) {
                     Some(ApiKind::OpenAi)
                 } else {
                     None
@@ -931,6 +961,47 @@ data: {\"id\":\"chatcmpl-partial\",\"object\":\"chat.completion.chunk\",\"model\
         r.process_event(PID, SSL_PTR, 0, &req, 1000, "");
         let result = r.process_event(PID, SSL_PTR, 1, &resp, 2000, "");
         assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_openai_path_accepts_query_and_trailing_slash() {
+        let mut r = Reassembler::new();
+        let req = make_request(
+            "gateway.local",
+            "/v1/chat/completions/?trace=1",
+            simple_openai_body(),
+        );
+        let resp = make_response(200, "application/json", simple_openai_response_body());
+
+        r.process_event(PID, SSL_PTR, 0, &req, 1000, "");
+        assert!(r.process_event(PID, SSL_PTR, 1, &resp, 2000, "").is_some());
+    }
+
+    #[test]
+    fn test_keep_alive_unknown_request_does_not_block_openai() {
+        let mut r = Reassembler::new();
+        let unknown = make_request("gateway.local", "/healthz", "");
+        let unknown_resp = make_response(200, "application/json", "{}");
+        let openai = make_request(
+            "gateway.local",
+            "/v1/chat/completions",
+            simple_openai_body(),
+        );
+        let openai_resp = make_response(200, "application/json", simple_openai_response_body());
+
+        assert!(r
+            .process_event(PID, SSL_PTR, 0, &unknown, 1000, "")
+            .is_none());
+        assert!(r
+            .process_event(PID, SSL_PTR, 1, &unknown_resp, 2000, "")
+            .is_none());
+        assert!(r
+            .process_event(PID, SSL_PTR, 0, &openai, 3000, "")
+            .is_none());
+        let (kind, _) = r
+            .process_event(PID, SSL_PTR, 1, &openai_resp, 4000, "")
+            .expect("new request on a keep-alive fd must be parsed independently");
+        assert_eq!(kind, ApiKind::OpenAi);
     }
 
     #[test]

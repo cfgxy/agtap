@@ -4,7 +4,7 @@ use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aya::maps::RingBuf;
 use clap::{Parser, Subcommand};
@@ -738,8 +738,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    let ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
-    let mut poll = tokio::io::unix::AsyncFd::new(ring_buf)?;
+    let mut ring_buf = RingBuf::try_from(ebpf.take_map("EVENTS").unwrap())?;
+    // Poll directly instead of relying solely on ring-buffer readiness notifications:
+    // adaptive wakeups can otherwise leave a quiet completed SSE exchange pending.
+    let mut ring_poll = tokio::time::interval(Duration::from_millis(50));
+    ring_poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut last_rescan = Instant::now();
 
     loop {
@@ -748,12 +751,9 @@ async fn main() -> anyhow::Result<()> {
                 eprintln!("\nagtap: shutting down");
                 break;
             }
-            guard = poll.readable_mut() => {
-                let mut guard = guard?;
-                let ring = guard.get_inner_mut();
-
+            _ = ring_poll.tick() => {
                 drain_ring_events(
-                    ring,
+                    &mut ring_buf,
                     &mut reassembler,
                     &mut stdio_reassembler,
                     boot_time_ns,
@@ -769,8 +769,6 @@ async fn main() -> anyhow::Result<()> {
                     &mut body_store,
                     &mut process_name_cache,
                 ).await;
-
-                guard.clear_ready();
             }
         }
 
