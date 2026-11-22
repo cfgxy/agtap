@@ -261,15 +261,19 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // Keep this as a BPF subprogram: a local explicit mask is preserved by the
 // arm64 6.1 verifier, unlike a range proven in its callers.
+const TCP_EMIT_FILTER_TLS: u32 = 1;
+const TCP_EMIT_FORCE_WAKEUP: u32 = 2;
+
 #[inline(never)]
 fn emit_tcp_event_chunk(
     fd: u32,
     buf_ptr: u64,
     len: u32,
     direction: u32,
-    filter_tls_record: bool,
-    force_wakeup: bool,
+    flags: u32,
 ) -> Result<(), u32> {
+    let filter_tls_record = flags & TCP_EMIT_FILTER_TLS != 0;
+    let force_wakeup = flags & TCP_EMIT_FORCE_WAKEUP != 0;
     // This mask is intentionally at the helper boundary; it gives the verifier
     // the concrete array bound even when callers supply an unknown scalar.
     let safe_len = (len & EVENT_LEN_MASK) as usize;
@@ -321,7 +325,7 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
     } else {
         len
     };
-    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, true, false)
+    emit_tcp_event_chunk(fd, buf_ptr, capped_len, direction, TCP_EMIT_FILTER_TLS)
 }
 
 const MAX_GO_SYSCALL_CHUNKS: u32 =
@@ -347,14 +351,13 @@ fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result
         } else {
             remaining
         };
-        emit_tcp_event_chunk(
-            fd,
-            buf_ptr + offset as u64,
-            chunk_len,
-            direction,
-            chunk_index == 0,
-            true,
-        )?;
+        let flags = TCP_EMIT_FORCE_WAKEUP
+            | if chunk_index == 0 {
+                TCP_EMIT_FILTER_TLS
+            } else {
+                0
+            };
+        emit_tcp_event_chunk(fd, buf_ptr + offset as u64, chunk_len, direction, flags)?;
         remaining -= chunk_len;
         offset += chunk_len;
         chunk_index += 1;
