@@ -524,7 +524,26 @@ pub fn go_read_enter(ctx: TracePointContext) -> u32 {
 
 #[tracepoint]
 pub fn go_read_exit(ctx: TracePointContext) -> u32 {
-    match emit_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
+    let key = bpf_get_current_pid_tgid();
+    let args = unsafe { ACTIVE_GO_READ_CALLS.get(&key) };
+    let Some(args) = args else {
+        return 0;
+    };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = ACTIVE_GO_READ_CALLS.remove(&key);
+    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret <= 0 {
+        return 0;
+    }
+    let pid = (key >> 32) as u32;
+    if !is_go_server_fd(pid, fd) {
+        return 0;
+    }
+    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 0) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -540,7 +559,26 @@ pub fn go_write_enter(ctx: TracePointContext) -> u32 {
 
 #[tracepoint]
 pub fn go_write_exit(ctx: TracePointContext) -> u32 {
-    match emit_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
+    let key = bpf_get_current_pid_tgid();
+    let args = unsafe { ACTIVE_GO_WRITE_CALLS.get(&key) };
+    let Some(args) = args else {
+        return 0;
+    };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = ACTIVE_GO_WRITE_CALLS.remove(&key);
+    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret <= 0 {
+        return 0;
+    }
+    let pid = (key >> 32) as u32;
+    if !is_go_server_fd(pid, fd) {
+        return 0;
+    }
+    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 1) {
         Ok(()) => 0,
         Err(_) => 1,
     }
