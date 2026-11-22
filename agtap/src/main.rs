@@ -124,6 +124,14 @@ struct Cli {
     #[arg(long, default_value = "24")]
     body_retention: u64,
 
+    /// Warn and checkpoint bodies once this percentage of the body-store limit is reached.
+    #[arg(long, default_value = "90")]
+    body_store_high_water_percent: u8,
+
+    /// Skip only new body capture at this percentage of the body-store limit.
+    #[arg(long, default_value = "100")]
+    body_store_hard_water_percent: u8,
+
     /// Maximum request/response body retained in each detail file (default: 512 KiB; hard cap: 1024 KiB)
     #[arg(long, default_value = "512")]
     max_body_retain_kb: u64,
@@ -367,8 +375,14 @@ async fn drain_ring_events(
                 let parsed = parse_exchange(api_kind, exchange);
                 if let Some((call, detail)) = parsed {
                     let body_path = body_store
-                        .write(event.pid, event.timestamp_ns, &call.id, &detail)
+                        .write_if_within_hard_water(
+                            event.pid,
+                            event.timestamp_ns,
+                            &call.id,
+                            &detail,
+                        )
                         .ok()
+                        .flatten()
                         .map(|p| p.to_string_lossy().into_owned());
                     let proc_name =
                         resolve_proc_name(process_name_cache, event.pid, &comm, &call, &detail);
@@ -703,7 +717,13 @@ async fn main() -> anyhow::Result<()> {
     let mut process_name_cache: HashMap<u32, String> = HashMap::new();
 
     let bodies_dir = runtime_dir.join("bodies");
-    let mut body_store = BodyStore::open(&bodies_dir, cli.max_body_store, cli.body_retention)?;
+    let mut body_store = BodyStore::open_with_watermarks(
+        &bodies_dir,
+        cli.max_body_store,
+        cli.body_retention,
+        cli.body_store_high_water_percent,
+        cli.body_store_hard_water_percent,
+    )?;
     eprintln!("agtap: body store at {}", bodies_dir.display());
 
     // Track known paths for periodic re-scanning.
@@ -789,7 +809,28 @@ async fn main() -> anyhow::Result<()> {
                 .as_ref()
                 .map(|queue| queue.protected_body_paths(None))
                 .unwrap_or_default();
-            body_store.cleanup_if_needed(&protected_body_paths);
+            if let Some(queue) = archive_queue.as_ref() {
+                body_store.cleanup_if_needed_with_checkpoint(&protected_body_paths, |body_path| {
+                    queue
+                        .checkpoint_active_body(
+                            &log_path,
+                            body_path,
+                            &cli.archive_s3_prefix,
+                            cli.archive_compression,
+                        )
+                        .unwrap_or(false)
+                });
+                if body_store.is_over_high_water() {
+                    warn!(
+                        "archive backlog: pending_jobs={}, checkpoint_jobs={}, skipped_new_bodies={}",
+                        queue.pending_count(),
+                        queue.checkpoint_backlog_count(),
+                        body_store.dropped_new_bodies()
+                    );
+                }
+            } else {
+                body_store.cleanup_if_needed(&protected_body_paths);
+            }
             stdio_reassembler.cleanup_idle(IDLE_TIMEOUT_SECS);
             process_name_cache.retain(|pid, _| fs::metadata(format!("/proc/{}", pid)).is_ok());
             last_cleanup = Instant::now();
@@ -804,8 +845,9 @@ async fn main() -> anyhow::Result<()> {
                 let parsed = parse_exchange(api_kind, exchange);
                 if let Some((call, detail)) = parsed {
                     let body_path = body_store
-                        .write(pid, 0, &call.id, &detail)
+                        .write_if_within_hard_water(pid, 0, &call.id, &detail)
                         .ok()
+                        .flatten()
                         .map(|p| p.to_string_lossy().into_owned());
                     let proc_name =
                         resolve_proc_name(&mut process_name_cache, pid, &comm, &call, &detail);

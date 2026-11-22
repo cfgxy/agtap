@@ -11,6 +11,8 @@ agtap \
   --archive-s3-bucket agtap \
   --archive-s3-prefix sub2api \
   --archive-compression zstd \
+  --body-store-high-water-percent 90 \
+  --body-store-hard-water-percent 100 \
   --max-body-retain-kb 1024
 ```
 
@@ -33,6 +35,12 @@ agtap \
 - manifest 列出两个 part 的 key、压缩后 size 和 SHA-256；它是唯一提交标记。
 
 worker 按 **bodies → events → manifest** 上传。每一个对象 Put 后都执行 HeadObject，核对 size 和 `sha256` 元数据。仅 manifest 校验成功后才删除 pending job、轮转快照、缓存 payload 与关联正文。上传/HeadObject 任一失败会保留这些文件和持久 job，按退避重试；重启会继续同一 rotation 的同一 key，不创建新 part。
+
+### 活动日志正文与水位
+
+容量或时限清理命中仍在 `events.jsonl` 的正文时，agtap 先写入并回读校验一个原子 checkpoint：其中有事件 ID、事件—正文关联、正文副本及 SHA-256。只有 checkpoint job 落盘校验成功后才会回收原正文；后台 worker 继续按上述同一 manifest 契约上传，采集、转发和轮转均不等待网络。checkpoint 已提交的事件会在后续普通轮转中去重。
+
+`--body-store-high-water-percent`（默认 90）和 `--body-store-hard-water-percent`（默认 100）必须满足 `0 < high <= hard <= 100`。高水位时日志会输出仅含计数的归档积压状态；S3 持续失败导致硬水位后，agtap 只跳过**新**正文文件，仍输出事件并保持旁路业务转发。未提交的旧正文和 checkpoint payload 不会为了腾空间被删除。
 
 ### DuckDB 查询
 
@@ -60,5 +68,6 @@ Trino 的对象存储 catalog 与 JSONL/Zstd reader 配置由部署侧管理。�
 - `archive/pending/*.json`：持久重试作业与固定对象 key/checksum。
 - `archive/closed/*.jsonl`：轮转日志的唯一快照，避免 `.1`/`.2` 改名覆盖输入。
 - `archive/payloads/`：两个压缩 part 和 manifest 的可恢复本地 payload。
+- `archive/committed/`：已提交 checkpoint 的事件 ID 标记，供后续轮转去重。
 
-正文清理读取 pending job 引用；在 manifest 成功前不会删除关联正文。`scripts/verify_archive.sh` 只覆盖本地队列/快照行为；真实 S3/MinIO 与 DuckDB/Trino 读取必须在具备正常凭据和同候选版本的隔离环境验证。
+正文清理读取 pending job 引用；活动日志正文在 checkpoint 校验前不会删除，checkpoint 和轮转都在 manifest 成功前保留可恢复内容。`scripts/verify_archive.sh` 只覆盖本地队列/快照行为；真实 S3/MinIO 与 DuckDB/Trino 读取必须在具备正常凭据和同候选版本的隔离环境验证。
