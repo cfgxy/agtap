@@ -602,7 +602,12 @@ async fn main() -> anyhow::Result<()> {
                 err
             )
         })?;
-        eprintln!("agtap: Go arm64 syscall kprobes attached for PID {}", pid);
+        let backend = if std::env::consts::ARCH == "aarch64" {
+            "arm64 syscall kprobes"
+        } else {
+            "syscall tracepoints"
+        };
+        eprintln!("agtap: Go {backend} attached for PID {pid}");
     } else {
         info!("Go direct-syscall HTTP capture requires --pid or a resolved --comm target");
     }

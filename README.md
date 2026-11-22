@@ -109,7 +109,7 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 | `--archive-compression <zstd|lz4>` | Archive JSONL part codec (default: Zstd; DuckDB JSON S3 direct-read validated for `.zst`; LZ4 frame is explicit only) |
 | `--archive-retry-delay-secs <SECONDS>` | Base delay for failed archive retries (default: 5) |
 
-For a selected `--pid`/`--comm` target, agtap refuses to start if the ARM64 Go direct-syscall kprobes cannot load and attach. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.
+For a selected `--pid`/`--comm` target, agtap refuses to start if the active Go direct-syscall backend cannot load and attach: ARM64 uses `__arm64_sys_*` kprobes/kretprobes; other architectures retain the `syscalls` tracepoint backend. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.
 
 One syscall is emitted as at most three fixed-size ring-buffer events of 512 KiB each, which covers the 1 MiB body cap plus the 64 KiB HTTP header allowance. The event ring buffer holds 16 MiB (~32 records).
 

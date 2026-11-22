@@ -18,9 +18,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_buf,
     },
-    macros::{kprobe, kretprobe, map, uprobe, uretprobe},
+    macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
     maps::{Array, HashMap, RingBuf},
-    programs::{ProbeContext, RetProbeContext},
+    programs::{ProbeContext, RetProbeContext, TracePointContext},
 };
 
 mod vmlinux;
@@ -584,6 +584,114 @@ pub fn go_arm64_write_ret(ctx: RetProbeContext) -> u32 {
     }
 }
 
+// ── Generic syscall tracepoint fallback (non-arm64) ──────────────────────
+// Tracepoint layouts are stable for the legacy x86 path. Keep this separate
+// from the arm64 wrappers because Amazon Linux arm64 6.1 rejects those contexts.
+const TRACEPOINT_SYSCALL_FD_OFFSET: usize = 16;
+const TRACEPOINT_SYSCALL_BUF_OFFSET: usize = 24;
+const TRACEPOINT_SYSCALL_RET_OFFSET: usize = 16;
+
+#[inline(always)]
+fn stash_tracepoint_go_call(
+    ctx: &TracePointContext,
+    calls: &HashMap<u64, TcpRecvArgs>,
+) -> Result<(), u32> {
+    if !is_target_process() {
+        return Ok(());
+    }
+    let fd = unsafe {
+        ctx.read_at::<u64>(TRACEPOINT_SYSCALL_FD_OFFSET)
+            .map_err(|_| 1u32)?
+    } as u32;
+    let buf_ptr = unsafe {
+        ctx.read_at::<u64>(TRACEPOINT_SYSCALL_BUF_OFFSET)
+            .map_err(|_| 1u32)?
+    };
+    let key = bpf_get_current_pid_tgid();
+    calls
+        .insert(&key, &TcpRecvArgs { fd, buf_ptr }, 0)
+        .map_err(|_| 1u32)
+}
+
+#[tracepoint]
+pub fn go_trace_accept_exit(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let ret = match unsafe { ctx.read_at::<i64>(TRACEPOINT_SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret < 0 {
+        return 0;
+    }
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    match GO_SERVER_FDS.insert(&tcp_connection_key(pid, ret as u32), &1, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_trace_read_enter(ctx: TracePointContext) -> u32 {
+    match stash_tracepoint_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_trace_read_exit(ctx: TracePointContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let Some(args) = (unsafe { ACTIVE_GO_READ_CALLS.get(&key) }) else {
+        return 0;
+    };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = ACTIVE_GO_READ_CALLS.remove(&key);
+    let ret = match unsafe { ctx.read_at::<i64>(TRACEPOINT_SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret <= 0 || !is_go_server_fd((key >> 32) as u32, fd) {
+        return 0;
+    }
+    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 0) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_trace_write_enter(ctx: TracePointContext) -> u32 {
+    match stash_tracepoint_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_trace_write_exit(ctx: TracePointContext) -> u32 {
+    let key = bpf_get_current_pid_tgid();
+    let Some(args) = (unsafe { ACTIVE_GO_WRITE_CALLS.get(&key) }) else {
+        return 0;
+    };
+    let fd = args.fd;
+    let buf_ptr = args.buf_ptr;
+    let _ = ACTIVE_GO_WRITE_CALLS.remove(&key);
+    let ret = match unsafe { ctx.read_at::<i64>(TRACEPOINT_SYSCALL_RET_OFFSET) } {
+        Ok(ret) => ret,
+        Err(_) => return 1,
+    };
+    if ret <= 0 || !is_go_server_fd((key >> 32) as u32, fd) {
+        return 0;
+    }
+    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 1) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
 fn emit_tcp_close(fd: u32) -> Result<(), u32> {
     if let Some(mut entry) = EVENTS.reserve::<SslEvent>(0) {
         let event = entry.as_mut_ptr();
@@ -616,6 +724,27 @@ pub fn go_arm64_close_enter(ctx: ProbeContext) -> u32 {
     };
     let fd = match arm64_syscall_fd(regs) {
         Ok(fd) => fd,
+        Err(_) => return 1,
+    };
+    let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
+    let key = tcp_connection_key(pid, fd);
+    if unsafe { GO_SERVER_FDS.get(&key).is_none() } {
+        return 0;
+    }
+    let _ = GO_SERVER_FDS.remove(&key);
+    match emit_tcp_close(fd) {
+        Ok(()) => 0,
+        Err(_) => 1,
+    }
+}
+
+#[tracepoint]
+pub fn go_trace_close_enter(ctx: TracePointContext) -> u32 {
+    if !is_target_process() {
+        return 0;
+    }
+    let fd = match unsafe { ctx.read_at::<u64>(TRACEPOINT_SYSCALL_FD_OFFSET) } {
+        Ok(fd) => fd as u32,
         Err(_) => return 1,
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
