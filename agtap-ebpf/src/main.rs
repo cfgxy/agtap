@@ -488,6 +488,10 @@ fn stash_arm64_go_call(
         .map_err(|_| 1u32)
 }
 
+// kretprobe return registers are verifier-context-derived scalars; force this
+// small dispatcher into the program so arm64 6.1 does not reject a BPF-to-BPF
+// call with that value.
+#[inline(always)]
 fn emit_arm64_go_call(
     ret: i64,
     calls: &HashMap<u64, TcpRecvArgs>,
