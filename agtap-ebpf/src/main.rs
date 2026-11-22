@@ -270,14 +270,14 @@ fn emit_tcp_event_chunk(
     filter_tls_record: bool,
     force_wakeup: bool,
 ) -> Result<(), u32> {
-    // Clamp at the helper boundary rather than relying on caller bounds or a
-    // bitmask. arm64 Linux 6.1 does not preserve the former through inlining
-    // and rejects an unbounded `bpf_probe_read_user` size.
-    let safe_len = if len > MAX_EVENT_BYTES {
+    // Keep an explicit bitmask at the immediate slice boundary: arm64 6.1
+    // verifier does not retain the branch-derived upper bound here.
+    let capped_len = if len > MAX_EVENT_BYTES {
         MAX_EVENT_BYTES
     } else {
         len
-    } as usize;
+    };
+    let safe_len = (capped_len & EVENT_LEN_MASK) as usize;
 
     // Only inspect the first chunk. Subsequent chunks may naturally start with
     // a TLS-record-looking byte even when the HTTP message is plaintext.
@@ -459,8 +459,7 @@ fn is_go_server_fd(pid: u32, fd: u32) -> bool {
     unsafe { GO_SERVER_FDS.get(&tcp_connection_key(pid, fd)).is_some() }
 }
 
-fn arm64_syscall_fd_and_buf(ctx: &ProbeContext) -> Result<(u32, u64), u32> {
-    let regs = ctx.arg::<*const Arm64SyscallRegs>(0).ok_or(1u32)?;
+fn arm64_syscall_fd_and_buf(regs: *const Arm64SyscallRegs) -> Result<(u32, u64), u32> {
     if regs.is_null() {
         return Err(1);
     }
@@ -471,19 +470,18 @@ fn arm64_syscall_fd_and_buf(ctx: &ProbeContext) -> Result<(u32, u64), u32> {
     Ok((fd, buf_ptr))
 }
 
-fn arm64_syscall_fd(ctx: &ProbeContext) -> Result<u32, u32> {
-    let regs = ctx.arg::<*const Arm64SyscallRegs>(0).ok_or(1u32)?;
+fn arm64_syscall_fd(regs: *const Arm64SyscallRegs) -> Result<u32, u32> {
     if regs.is_null() {
         return Err(1);
     }
     Ok(unsafe { bpf_probe_read_kernel(&(*regs).regs[0] as *const u64) }.map_err(|_| 1u32)? as u32)
 }
 
-fn stash_arm64_go_call(ctx: &ProbeContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
-    if !is_target_process() {
-        return Ok(());
-    }
-    let (fd, buf_ptr) = arm64_syscall_fd_and_buf(ctx)?;
+fn stash_arm64_go_call(
+    regs: *const Arm64SyscallRegs,
+    calls: &HashMap<u64, TcpRecvArgs>,
+) -> Result<(), u32> {
+    let (fd, buf_ptr) = arm64_syscall_fd_and_buf(regs)?;
     let key = bpf_get_current_pid_tgid();
     calls
         .insert(&key, &TcpRecvArgs { fd, buf_ptr }, 0)
@@ -491,7 +489,7 @@ fn stash_arm64_go_call(ctx: &ProbeContext, calls: &HashMap<u64, TcpRecvArgs>) ->
 }
 
 fn emit_arm64_go_call(
-    ctx: &RetProbeContext,
+    ret: i64,
     calls: &HashMap<u64, TcpRecvArgs>,
     direction: u32,
 ) -> Result<(), u32> {
@@ -501,7 +499,6 @@ fn emit_arm64_go_call(
     let buf_ptr = args.buf_ptr;
     let _ = calls.remove(&key);
 
-    let ret: i64 = ctx.ret().ok_or(1u32)?;
     if ret <= 0 {
         return Ok(());
     }
@@ -533,7 +530,14 @@ pub fn go_arm64_accept4_ret(ctx: RetProbeContext) -> u32 {
 
 #[kprobe]
 pub fn go_arm64_read_enter(ctx: ProbeContext) -> u32 {
-    match stash_arm64_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
+    if !is_target_process() {
+        return 0;
+    }
+    let regs = match ctx.arg::<*const Arm64SyscallRegs>(0) {
+        Some(regs) => regs,
+        None => return 1,
+    };
+    match stash_arm64_go_call(regs, &ACTIVE_GO_READ_CALLS) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -541,7 +545,11 @@ pub fn go_arm64_read_enter(ctx: ProbeContext) -> u32 {
 
 #[kretprobe]
 pub fn go_arm64_read_ret(ctx: RetProbeContext) -> u32 {
-    match emit_arm64_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
+    let ret = match ctx.ret() {
+        Some(ret) => ret,
+        None => return 1,
+    };
+    match emit_arm64_go_call(ret, &ACTIVE_GO_READ_CALLS, 0) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -549,7 +557,14 @@ pub fn go_arm64_read_ret(ctx: RetProbeContext) -> u32 {
 
 #[kprobe]
 pub fn go_arm64_write_enter(ctx: ProbeContext) -> u32 {
-    match stash_arm64_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
+    if !is_target_process() {
+        return 0;
+    }
+    let regs = match ctx.arg::<*const Arm64SyscallRegs>(0) {
+        Some(regs) => regs,
+        None => return 1,
+    };
+    match stash_arm64_go_call(regs, &ACTIVE_GO_WRITE_CALLS) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -557,7 +572,11 @@ pub fn go_arm64_write_enter(ctx: ProbeContext) -> u32 {
 
 #[kretprobe]
 pub fn go_arm64_write_ret(ctx: RetProbeContext) -> u32 {
-    match emit_arm64_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
+    let ret = match ctx.ret() {
+        Some(ret) => ret,
+        None => return 1,
+    };
+    match emit_arm64_go_call(ret, &ACTIVE_GO_WRITE_CALLS, 1) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -589,7 +608,11 @@ pub fn go_arm64_close_enter(ctx: ProbeContext) -> u32 {
     if !is_target_process() {
         return 0;
     }
-    let fd = match arm64_syscall_fd(&ctx) {
+    let regs = match ctx.arg::<*const Arm64SyscallRegs>(0) {
+        Some(regs) => regs,
+        None => return 1,
+    };
+    let fd = match arm64_syscall_fd(regs) {
         Ok(fd) => fd,
         Err(_) => return 1,
     };
