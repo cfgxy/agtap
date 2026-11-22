@@ -23,15 +23,40 @@ pub const LIBC_PROBES: &[(&str, &[&str])] = &[
     ("tcp_recv_ret", &["recv"]),
 ];
 
-const GO_SYSCALL_PROBES: &[(&str, &str)] = &[
-    ("go_accept_exit", "sys_exit_accept"),
-    ("go_accept_exit", "sys_exit_accept4"),
-    ("go_read_enter", "sys_enter_read"),
-    ("go_read_exit", "sys_exit_read"),
-    ("go_write_enter", "sys_enter_write"),
-    ("go_write_exit", "sys_exit_write"),
-    ("go_close_enter", "sys_enter_close"),
+// Amazon Linux 2023 arm64 exports these syscall wrappers. Kprobe entry programs
+// receive their pt_regs pointer in x0; kretprobes receive the syscall return.
+const GO_ARM64_SYSCALL_PROBES: &[(&str, &str)] = &[
+    ("go_arm64_accept4_ret", "__arm64_sys_accept4"),
+    ("go_arm64_read_enter", "__arm64_sys_read"),
+    ("go_arm64_read_ret", "__arm64_sys_read"),
+    ("go_arm64_write_enter", "__arm64_sys_write"),
+    ("go_arm64_write_ret", "__arm64_sys_write"),
+    ("go_arm64_close_enter", "__arm64_sys_close"),
 ];
+
+const GO_TRACEPOINT_PROBES: &[(&str, &str)] = &[
+    ("go_trace_accept_exit", "sys_exit_accept"),
+    ("go_trace_accept_exit", "sys_exit_accept4"),
+    ("go_trace_read_enter", "sys_enter_read"),
+    ("go_trace_read_exit", "sys_exit_read"),
+    ("go_trace_write_enter", "sys_enter_write"),
+    ("go_trace_write_exit", "sys_exit_write"),
+    ("go_trace_close_enter", "sys_enter_close"),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GoSyscallBackend {
+    Arm64Kprobe,
+    Tracepoint,
+}
+
+fn go_syscall_backend_for_arch(arch: &str) -> GoSyscallBackend {
+    if arch == "aarch64" {
+        GoSyscallBackend::Arm64Kprobe
+    } else {
+        GoSyscallBackend::Tracepoint
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 struct TcpSocket {
@@ -118,9 +143,9 @@ fn seed_go_server_fds(ebpf: &mut aya::Ebpf, pid: i32) -> anyhow::Result<usize> {
     Ok(seeded)
 }
 
-/// Attach syscall tracepoints for a single statically-linked Go server.
+/// Attach arm64 syscall wrapper kprobes for a single statically-linked Go server.
 /// `capture_max_bytes` is the configured body allowance plus a bounded HTTP
-/// header allowance. The BPF-side PID map suppresses unrelated tracepoint traffic.
+/// header allowance. The BPF-side PID map suppresses unrelated traffic.
 pub fn load_and_attach_go_syscalls(
     ebpf: &mut aya::Ebpf,
     pid: i32,
@@ -140,26 +165,40 @@ pub fn load_and_attach_go_syscalls(
     capture_limit.set(0, capture_max_bytes, 0)?;
     drop(capture_limit);
 
-    for prog_name in [
-        "go_accept_exit",
-        "go_read_enter",
-        "go_read_exit",
-        "go_write_enter",
-        "go_write_exit",
-        "go_close_enter",
-    ] {
-        let prog: &mut TracePoint = ebpf
-            .program_mut(prog_name)
-            .expect("BPF syscall program must exist")
-            .try_into()?;
-        prog.load()?;
-    }
-    for (prog_name, tracepoint) in GO_SYSCALL_PROBES {
-        let prog: &mut TracePoint = ebpf
-            .program_mut(prog_name)
-            .expect("BPF syscall program must exist")
-            .try_into()?;
-        prog.attach("syscalls", tracepoint)?;
+    match go_syscall_backend_for_arch(std::env::consts::ARCH) {
+        GoSyscallBackend::Arm64Kprobe => {
+            for (prog_name, symbol) in GO_ARM64_SYSCALL_PROBES {
+                let prog: &mut KProbe = ebpf
+                    .program_mut(prog_name)
+                    .expect("BPF arm64 syscall program must exist")
+                    .try_into()?;
+                prog.load()?;
+                prog.attach(symbol, 0)?;
+            }
+        }
+        GoSyscallBackend::Tracepoint => {
+            for prog_name in [
+                "go_trace_accept_exit",
+                "go_trace_read_enter",
+                "go_trace_read_exit",
+                "go_trace_write_enter",
+                "go_trace_write_exit",
+                "go_trace_close_enter",
+            ] {
+                let prog: &mut TracePoint = ebpf
+                    .program_mut(prog_name)
+                    .expect("BPF syscall tracepoint program must exist")
+                    .try_into()?;
+                prog.load()?;
+            }
+            for (prog_name, tracepoint) in GO_TRACEPOINT_PROBES {
+                let prog: &mut TracePoint = ebpf
+                    .program_mut(prog_name)
+                    .expect("BPF syscall tracepoint program must exist")
+                    .try_into()?;
+                prog.attach("syscalls", tracepoint)?;
+            }
+        }
     }
     match seed_go_server_fds(ebpf, pid) {
         Ok(0) => debug!("No established server sockets to seed for PID {pid}"),
@@ -320,7 +359,10 @@ fn attach_extra_targets(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tcp_socket, server_socket_inodes, TcpSocket};
+    use super::{
+        go_syscall_backend_for_arch, parse_tcp_socket, server_socket_inodes, GoSyscallBackend,
+        TcpSocket, GO_ARM64_SYSCALL_PROBES, GO_TRACEPOINT_PROBES,
+    };
 
     #[test]
     fn parses_established_proc_tcp_socket() {
@@ -336,6 +378,36 @@ mod tests {
     #[test]
     fn rejects_malformed_proc_tcp_socket() {
         assert!(parse_tcp_socket("not a tcp record").is_none());
+    }
+
+    #[test]
+    fn arm64_syscall_kprobes_cover_the_production_symbols() {
+        assert_eq!(
+            GO_ARM64_SYSCALL_PROBES,
+            [
+                ("go_arm64_accept4_ret", "__arm64_sys_accept4"),
+                ("go_arm64_read_enter", "__arm64_sys_read"),
+                ("go_arm64_read_ret", "__arm64_sys_read"),
+                ("go_arm64_write_enter", "__arm64_sys_write"),
+                ("go_arm64_write_ret", "__arm64_sys_write"),
+                ("go_arm64_close_enter", "__arm64_sys_close"),
+            ]
+        );
+    }
+
+    #[test]
+    fn selects_arm64_kprobes_and_generic_tracepoints_by_architecture() {
+        assert_eq!(
+            go_syscall_backend_for_arch("aarch64"),
+            GoSyscallBackend::Arm64Kprobe
+        );
+        assert_eq!(
+            go_syscall_backend_for_arch("x86_64"),
+            GoSyscallBackend::Tracepoint
+        );
+        assert!(GO_TRACEPOINT_PROBES
+            .iter()
+            .any(|(_, name)| *name == "sys_exit_accept4"));
     }
 
     #[test]

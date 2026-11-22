@@ -315,7 +315,7 @@ async fn drain_ring_events(
                 sinks.emit(&agent_event).await;
             }
         } else {
-            // The syscall tracepoints are global, so enforce the selected PID
+            // The syscall kprobes are global, so enforce the selected PID
             // again before accepting TCP or SSL data in userspace.
             if let Some(pid) = target_pid {
                 if event.pid != pid as u32 {
@@ -325,7 +325,7 @@ async fn drain_ring_events(
 
             // Connection ID encoding uses upper 4 bits as type tag:
             //   0x0_... = SSL pointer (from SSL uprobe, ssl_ptr field is real pointer)
-            //   0x1_... = TCP fd (from send/recv uprobe or Go syscall tracepoint)
+            //   0x1_... = TCP fd (from send/recv uprobe or Go syscall kprobe)
             let conn_id = if is_tcp {
                 event.ssl_ptr | (1u64 << 60) // type tag: TCP
             } else {
@@ -588,7 +588,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
 
-    // A statically linked Go server bypasses libc send/recv. Syscall tracepoints
+    // A statically linked Go server bypasses libc send/recv. ARM64 syscall kprobes
     // are attached only with an exact selected PID and the BPF map filters events
     // to sockets accepted by that process.
     if let Some(pid) = target_pid {
@@ -602,10 +602,12 @@ async fn main() -> anyhow::Result<()> {
                 err
             )
         })?;
-        eprintln!(
-            "agtap: Go read/write syscall tracepoints attached for PID {}",
-            pid
-        );
+        let backend = if std::env::consts::ARCH == "aarch64" {
+            "arm64 syscall kprobes"
+        } else {
+            "syscall tracepoints"
+        };
+        eprintln!("agtap: Go {backend} attached for PID {pid}");
     } else {
         info!("Go direct-syscall HTTP capture requires --pid or a resolved --comm target");
     }
