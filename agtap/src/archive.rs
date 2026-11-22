@@ -70,6 +70,15 @@ pub struct ArchiveConfig {
     pub compression: ArchiveCompression,
 }
 
+/// The cleanup path may reclaim a body only for either of these successful,
+/// distinguishable outcomes. Any I/O or event-log parse error remains a
+/// protection failure and therefore retains the body for a later retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    Checkpointed,
+    Orphaned,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ArchiveJob {
     id: String,
@@ -268,25 +277,28 @@ impl ArchiveQueue {
         body_path: &Path,
         object_prefix: &str,
         compression: ArchiveCompression,
-    ) -> io::Result<bool> {
+    ) -> io::Result<CheckpointOutcome> {
         if !body_path.is_file() {
-            return Ok(false);
+            return Ok(CheckpointOutcome::Orphaned);
         }
         let body = fs::read(body_path)?;
         let body_sha256 = sha256_hex(&body);
         let source = fs::read_to_string(active_log)?;
         let original_path = body_path.to_string_lossy().into_owned();
-        let matching_lines = source
-            .lines()
-            .filter(|line| !line.trim().is_empty())
-            .filter_map(|line| {
-                let event: Value = serde_json::from_str(line).ok()?;
-                (event.get("body_path").and_then(Value::as_str) == Some(original_path.as_str()))
-                    .then_some((line.to_string(), event))
-            })
-            .collect::<Vec<_>>();
+        let mut matching_lines = Vec::new();
+        for line in source.lines().filter(|line| !line.trim().is_empty()) {
+            let event: Value = serde_json::from_str(line).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active event log is not valid JSON: {err}"),
+                )
+            })?;
+            if event.get("body_path").and_then(Value::as_str) == Some(original_path.as_str()) {
+                matching_lines.push((line.to_string(), event));
+            }
+        }
         if matching_lines.is_empty() {
-            return Ok(false);
+            return Ok(CheckpointOutcome::Orphaned);
         }
 
         let mut seed = body.clone();
@@ -295,8 +307,16 @@ impl ArchiveQueue {
             seed.push(b'\n');
         }
         let id = format!("checkpoint-{}", sha256_hex(&seed));
-        if self.load_job(&id).is_some() {
-            return Ok(true);
+        if let Some(job) = self.load_job(&id) {
+            return self
+                .verify_checkpoint(&job)?
+                .then_some(CheckpointOutcome::Checkpointed)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "checkpoint record failed verification",
+                    )
+                });
         }
 
         let stable_body = self.closed_dir.join(format!("{id}.body.json"));
@@ -305,10 +325,16 @@ impl ArchiveQueue {
         let mut checkpoint_events = Vec::new();
         for (_, mut event) in matching_lines {
             let Some(event_id) = event.get("id").and_then(Value::as_str) else {
-                return Ok(false);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active event with a body_path has no stable id",
+                ));
             };
             if event_id.is_empty() {
-                return Ok(false);
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active event with a body_path has an empty stable id",
+                ));
             }
             event_ids.push(event_id.to_string());
             event["body_path"] = Value::String(stable_body.to_string_lossy().into_owned());
@@ -321,7 +347,7 @@ impl ArchiveQueue {
                 .join(format!("{}.json", checkpoint_marker_id(event_id)))
                 .is_file()
         }) {
-            return Ok(true);
+            return Ok(CheckpointOutcome::Checkpointed);
         }
 
         write_atomic(&stable_body, &body)?;
@@ -329,7 +355,10 @@ impl ArchiveQueue {
         if sha256_hex(&fs::read(&stable_body)?) != body_sha256
             || fs::read(&snapshot)? != checkpoint_events
         {
-            return Ok(false);
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checkpoint payload verification failed",
+            ));
         }
 
         let job = ArchiveJob {
@@ -362,9 +391,18 @@ impl ArchiveQueue {
             next_attempt_at: 0,
         };
         self.save_job(&job)?;
-        Ok(self
-            .load_job(&id)
-            .is_some_and(|saved| self.verify_checkpoint(&saved).unwrap_or(false)))
+        self.load_job(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "checkpoint record disappeared"))
+            .and_then(|saved| {
+                self.verify_checkpoint(&saved)?
+                    .then_some(CheckpointOutcome::Checkpointed)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "checkpoint record failed verification",
+                        )
+                    })
+            })
     }
 
     fn verify_checkpoint(&self, job: &ArchiveJob) -> io::Result<bool> {
@@ -1418,9 +1456,12 @@ mod tests {
         )
         .unwrap();
 
-        assert!(queue
-            .checkpoint_active_body(&active, &body, "tenant", ArchiveCompression::Zstd)
-            .unwrap());
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&active, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
         assert!(queue.protected_body_paths(None).contains(&body));
         // This models cleanup after the verified local checkpoint, not a worker upload.
         fs::remove_file(&body).unwrap();
@@ -1490,6 +1531,22 @@ mod tests {
     }
 
     #[test]
+    fn invalid_active_log_never_classifies_a_body_as_orphan() {
+        let dir = TempDir::new().unwrap();
+        let queue = ArchiveQueue::open(&dir.path().join("runtime")).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(&body, b"fixture").unwrap();
+        let log = dir.path().join("events.jsonl");
+        fs::write(&log, "not-json\n").unwrap();
+
+        assert!(queue
+            .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+            .is_err());
+        assert_eq!(queue.pending_count(), 0);
+        assert!(body.exists());
+    }
+
+    #[test]
     fn checkpoint_is_idempotent_before_worker_runs() {
         let dir = TempDir::new().unwrap();
         let queue = ArchiveQueue::open(&dir.path().join("runtime")).unwrap();
@@ -1505,12 +1562,18 @@ mod tests {
             format!("{{\"id\":\"e1\",\"body_path\":\"{}\"}}\n", body.display()),
         )
         .unwrap();
-        assert!(queue
-            .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
-            .unwrap());
-        assert!(queue
-            .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
-            .unwrap());
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
         assert_eq!(queue.pending_count(), 1);
     }
 

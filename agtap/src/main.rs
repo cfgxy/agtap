@@ -811,14 +811,18 @@ async fn main() -> anyhow::Result<()> {
                 .unwrap_or_default();
             if let Some(queue) = archive_queue.as_ref() {
                 body_store.cleanup_if_needed_with_checkpoint(&protected_body_paths, |body_path| {
-                    queue
-                        .checkpoint_active_body(
-                            &log_path,
-                            body_path,
-                            &cli.archive_s3_prefix,
-                            cli.archive_compression,
-                        )
-                        .unwrap_or(false)
+                    match queue.checkpoint_active_body(
+                        &log_path,
+                        body_path,
+                        &cli.archive_s3_prefix,
+                        cli.archive_compression,
+                    ) {
+                        Ok(_) => true,
+                        Err(err) => {
+                            warn!("body cleanup retained a referenced body: {err}");
+                            false
+                        }
+                    }
                 });
                 if body_store.is_over_high_water() {
                     warn!(

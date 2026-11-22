@@ -38,7 +38,7 @@ worker 按 **bodies → events → manifest** 上传。每一个对象 Put 后�
 
 ### 活动日志正文与水位
 
-容量或时限清理命中仍在 `events.jsonl` 的正文时，agtap 先写入并回读校验一个原子 checkpoint：其中有事件 ID、事件—正文关联、正文副本及 SHA-256。只有 checkpoint job 落盘校验成功后才会回收原正文；后台 worker 继续按上述同一 manifest 契约上传，采集、转发和轮转均不等待网络。checkpoint 已提交的事件会在后续普通轮转中去重。
+容量或时限清理命中仍在 `events.jsonl` 的正文时，agtap 先写入并回读校验一个原子 checkpoint：其中有事件 ID、事件—正文关联、正文副本及 SHA-256。只有 checkpoint job 落盘校验成功后才会回收原正文；后台 worker 继续按上述同一 manifest 契约上传，采集、转发和轮转均不等待网络。checkpoint 已提交的事件会在后续普通轮转中去重。没有活动日志引用且不在 queue/rotation intent 保护集内的孤儿正文按原保留期/水位回收；日志读取、JSON 解析或 checkpoint 校验失败时保留正文以便重试。
 
 `--body-store-high-water-percent`（默认 90）和 `--body-store-hard-water-percent`（默认 100）必须满足 `0 < high <= hard <= 100`。高水位时日志会输出仅含计数的归档积压状态；S3 持续失败导致硬水位后，agtap 只跳过**新**正文文件，仍输出事件并保持旁路业务转发。未提交的旧正文和 checkpoint payload 不会为了腾空间被删除。
 

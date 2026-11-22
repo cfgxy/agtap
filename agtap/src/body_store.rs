@@ -160,8 +160,9 @@ impl BodyStore {
         self.cleanup_if_needed_with_checkpoint(protected_paths, |_| true);
     }
 
-    /// A body becomes reclaimable only after the callback has made a durable,
-    /// verified checkpoint. Returning false protects the body for a later retry.
+    /// A body becomes reclaimable only after the callback has either made a
+    /// durable, verified checkpoint or confirmed it has no active event reference.
+    /// Returning false protects the body for a later retry.
     pub fn cleanup_if_needed_with_checkpoint<F>(
         &mut self,
         protected_paths: &HashSet<PathBuf>,
@@ -280,6 +281,106 @@ mod tests {
         store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
         store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |_| true);
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn archive_cleanup_reclaims_unreferenced_orphan_under_pressure() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let orphan = body_dir.join("orphan.json");
+        fs::write(&orphan, b"orphan").unwrap();
+        store.total_bytes = fs::metadata(&orphan).unwrap().len();
+        let active_log = dir.path().join("events.jsonl");
+        fs::write(&active_log, "{\"id\":\"other\"}\n").unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(!orphan.exists());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn archive_cleanup_reclaims_unreferenced_orphan_after_retention() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 1, 0).unwrap();
+        let orphan = body_dir.join("expired-orphan.json");
+        fs::write(&orphan, b"orphan").unwrap();
+        store.total_bytes = fs::metadata(&orphan).unwrap().len();
+        fs::File::open(&orphan)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(1)),
+            )
+            .unwrap();
+        let active_log = dir.path().join("events.jsonl");
+        fs::write(&active_log, "{\"id\":\"other\"}\n").unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(!orphan.exists());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn archive_cleanup_retains_referenced_body_when_checkpoint_fails() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let body = body_dir.join("referenced.json");
+        fs::write(&body, b"referenced").unwrap();
+        store.total_bytes = fs::metadata(&body).unwrap().len();
+        let active_log = dir.path().join("events.jsonl");
+        // The body is referenced, but the malformed event has no stable ID and
+        // therefore cannot be checkpointed safely.
+        fs::write(
+            &active_log,
+            format!("{{\"body_path\":\"{}\"}}\n", body.display()),
+        )
+        .unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(body.exists());
+        assert_eq!(queue.pending_count(), 0);
     }
 
     #[test]
