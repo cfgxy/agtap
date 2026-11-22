@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use aya::{
     maps::{Array, HashMap as AyaHashMap},
-    programs::{KProbe, TracePoint, UProbe},
+    programs::{KProbe, UProbe},
 };
 use log::{debug, info, warn};
 
@@ -23,14 +23,15 @@ pub const LIBC_PROBES: &[(&str, &[&str])] = &[
     ("tcp_recv_ret", &["recv"]),
 ];
 
-const GO_SYSCALL_PROBES: &[(&str, &str)] = &[
-    ("go_accept_exit", "sys_exit_accept"),
-    ("go_accept_exit", "sys_exit_accept4"),
-    ("go_read_enter", "sys_enter_read"),
-    ("go_read_exit", "sys_exit_read"),
-    ("go_write_enter", "sys_enter_write"),
-    ("go_write_exit", "sys_exit_write"),
-    ("go_close_enter", "sys_enter_close"),
+// Amazon Linux 2023 arm64 exports these syscall wrappers. Kprobe entry programs
+// receive their pt_regs pointer in x0; kretprobes receive the syscall return.
+const GO_ARM64_SYSCALL_PROBES: &[(&str, &str)] = &[
+    ("go_arm64_accept4_ret", "__arm64_sys_accept4"),
+    ("go_arm64_read_enter", "__arm64_sys_read"),
+    ("go_arm64_read_ret", "__arm64_sys_read"),
+    ("go_arm64_write_enter", "__arm64_sys_write"),
+    ("go_arm64_write_ret", "__arm64_sys_write"),
+    ("go_arm64_close_enter", "__arm64_sys_close"),
 ];
 
 #[derive(Debug, PartialEq, Eq)]
@@ -118,14 +119,21 @@ fn seed_go_server_fds(ebpf: &mut aya::Ebpf, pid: i32) -> anyhow::Result<usize> {
     Ok(seeded)
 }
 
-/// Attach syscall tracepoints for a single statically-linked Go server.
+/// Attach arm64 syscall wrapper kprobes for a single statically-linked Go server.
 /// `capture_max_bytes` is the configured body allowance plus a bounded HTTP
-/// header allowance. The BPF-side PID map suppresses unrelated tracepoint traffic.
+/// header allowance. The BPF-side PID map suppresses unrelated traffic.
 pub fn load_and_attach_go_syscalls(
     ebpf: &mut aya::Ebpf,
     pid: i32,
     capture_max_bytes: u32,
 ) -> anyhow::Result<()> {
+    if std::env::consts::ARCH != "aarch64" {
+        anyhow::bail!(
+            "Go direct-syscall capture requires arm64 __arm64_sys_* kprobe symbols; collector architecture is {}",
+            std::env::consts::ARCH
+        );
+    }
+
     let mut target_pid = Array::<_, u32>::try_from(
         ebpf.map_mut("TARGET_PID")
             .expect("BPF target PID map must exist"),
@@ -140,26 +148,13 @@ pub fn load_and_attach_go_syscalls(
     capture_limit.set(0, capture_max_bytes, 0)?;
     drop(capture_limit);
 
-    for prog_name in [
-        "go_accept_exit",
-        "go_read_enter",
-        "go_read_exit",
-        "go_write_enter",
-        "go_write_exit",
-        "go_close_enter",
-    ] {
-        let prog: &mut TracePoint = ebpf
+    for (prog_name, symbol) in GO_ARM64_SYSCALL_PROBES {
+        let prog: &mut KProbe = ebpf
             .program_mut(prog_name)
-            .expect("BPF syscall program must exist")
+            .expect("BPF arm64 syscall program must exist")
             .try_into()?;
         prog.load()?;
-    }
-    for (prog_name, tracepoint) in GO_SYSCALL_PROBES {
-        let prog: &mut TracePoint = ebpf
-            .program_mut(prog_name)
-            .expect("BPF syscall program must exist")
-            .try_into()?;
-        prog.attach("syscalls", tracepoint)?;
+        prog.attach(symbol, 0)?;
     }
     match seed_go_server_fds(ebpf, pid) {
         Ok(0) => debug!("No established server sockets to seed for PID {pid}"),
@@ -320,7 +315,7 @@ fn attach_extra_targets(
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_tcp_socket, server_socket_inodes, TcpSocket};
+    use super::{parse_tcp_socket, server_socket_inodes, TcpSocket, GO_ARM64_SYSCALL_PROBES};
 
     #[test]
     fn parses_established_proc_tcp_socket() {
@@ -336,6 +331,21 @@ mod tests {
     #[test]
     fn rejects_malformed_proc_tcp_socket() {
         assert!(parse_tcp_socket("not a tcp record").is_none());
+    }
+
+    #[test]
+    fn arm64_syscall_kprobes_cover_the_production_symbols() {
+        assert_eq!(
+            GO_ARM64_SYSCALL_PROBES,
+            [
+                ("go_arm64_accept4_ret", "__arm64_sys_accept4"),
+                ("go_arm64_read_enter", "__arm64_sys_read"),
+                ("go_arm64_read_ret", "__arm64_sys_read"),
+                ("go_arm64_write_enter", "__arm64_sys_write"),
+                ("go_arm64_write_ret", "__arm64_sys_write"),
+                ("go_arm64_close_enter", "__arm64_sys_close"),
+            ]
+        );
     }
 
     #[test]

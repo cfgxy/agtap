@@ -18,9 +18,9 @@ use aya_ebpf::{
         bpf_get_current_comm, bpf_get_current_pid_tgid, bpf_ktime_get_ns, bpf_probe_read_kernel,
         bpf_probe_read_user_buf,
     },
-    macros::{kprobe, kretprobe, map, tracepoint, uprobe, uretprobe},
+    macros::{kprobe, kretprobe, map, uprobe, uretprobe},
     maps::{Array, HashMap, RingBuf},
-    programs::{ProbeContext, RetProbeContext, TracePointContext},
+    programs::{ProbeContext, RetProbeContext},
 };
 
 mod vmlinux;
@@ -425,15 +425,21 @@ fn try_tcp_recv_ret(ctx: &RetProbeContext) -> Result<(), u32> {
     emit_tcp_event(fd, buf_ptr, ret as u32, 1) // direction=1 (read)
 }
 
-// ── Go direct-syscall HTTP capture ──────────────────────────────────────
+// ── Go direct-syscall HTTP capture (arm64 syscall wrappers) ─────────────
 //
-// Go's net package issues read(2), write(2), accept4(2), and close(2)
-// directly from its statically linked runtime.  We track only sockets accepted
-// by the selected server process.  `read` therefore represents the inbound
-// HTTP request and `write` the outbound HTTP response.
-const SYSCALL_FD_OFFSET: usize = 16;
-const SYSCALL_BUF_OFFSET: usize = 24;
-const SYSCALL_RET_OFFSET: usize = 16;
+// On the production arm64 kernel, syscall tracepoint contexts fail verifier
+// validation. The exported __arm64_sys_* wrappers take a kernel pt_regs pointer
+// in x0. Kprobes read the original syscall arguments from that pointer and
+// kretprobes read the return value from their own probe context.
+//
+// Go's net package issues read(2), write(2), accept4(2), and close(2) directly
+// from its statically linked runtime. We track only sockets accepted by the
+// selected server process. `read` is an inbound HTTP request and `write` is an
+// outbound HTTP response.
+#[repr(C)]
+struct Arm64SyscallRegs {
+    regs: [u64; 31],
+}
 
 fn target_pid() -> u32 {
     TARGET_PID.get(0).copied().unwrap_or(0)
@@ -453,27 +459,39 @@ fn is_go_server_fd(pid: u32, fd: u32) -> bool {
     unsafe { GO_SERVER_FDS.get(&tcp_connection_key(pid, fd)).is_some() }
 }
 
-// Tracepoint context pointers cannot be passed to BPF subprograms on all
-// kernels/architectures (notably arm64 6.1). Keep this helper inlined so the
-// verifier sees context reads directly in each tracepoint entry program.
-#[inline(always)]
-fn stash_go_call(ctx: &TracePointContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
+fn arm64_syscall_fd_and_buf(ctx: &ProbeContext) -> Result<(u32, u64), u32> {
+    let regs = ctx.arg::<*const Arm64SyscallRegs>(0).ok_or(1u32)?;
+    if regs.is_null() {
+        return Err(1);
+    }
+    let fd =
+        unsafe { bpf_probe_read_kernel(&(*regs).regs[0] as *const u64) }.map_err(|_| 1u32)? as u32;
+    let buf_ptr =
+        unsafe { bpf_probe_read_kernel(&(*regs).regs[1] as *const u64) }.map_err(|_| 1u32)?;
+    Ok((fd, buf_ptr))
+}
+
+fn arm64_syscall_fd(ctx: &ProbeContext) -> Result<u32, u32> {
+    let regs = ctx.arg::<*const Arm64SyscallRegs>(0).ok_or(1u32)?;
+    if regs.is_null() {
+        return Err(1);
+    }
+    Ok(unsafe { bpf_probe_read_kernel(&(*regs).regs[0] as *const u64) }.map_err(|_| 1u32)? as u32)
+}
+
+fn stash_arm64_go_call(ctx: &ProbeContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
     if !is_target_process() {
         return Ok(());
     }
-    let fd = unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET).map_err(|_| 1u32)? } as u32;
-    let buf_ptr = unsafe { ctx.read_at::<u64>(SYSCALL_BUF_OFFSET).map_err(|_| 1u32)? };
+    let (fd, buf_ptr) = arm64_syscall_fd_and_buf(ctx)?;
     let key = bpf_get_current_pid_tgid();
     calls
         .insert(&key, &TcpRecvArgs { fd, buf_ptr }, 0)
         .map_err(|_| 1u32)
 }
 
-// See `stash_go_call`: inline context-consuming helpers for arm64 verifier
-// compatibility.
-#[inline(always)]
-fn emit_go_call(
-    ctx: &TracePointContext,
+fn emit_arm64_go_call(
+    ctx: &RetProbeContext,
     calls: &HashMap<u64, TcpRecvArgs>,
     direction: u32,
 ) -> Result<(), u32> {
@@ -483,7 +501,7 @@ fn emit_go_call(
     let buf_ptr = args.buf_ptr;
     let _ = calls.remove(&key);
 
-    let ret = unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET).map_err(|_| 1u32)? };
+    let ret: i64 = ctx.ret().ok_or(1u32)?;
     if ret <= 0 {
         return Ok(());
     }
@@ -494,91 +512,52 @@ fn emit_go_call(
     emit_go_tcp_events(fd, buf_ptr, ret as u32, direction)
 }
 
-#[tracepoint]
-pub fn go_accept_exit(ctx: TracePointContext) -> u32 {
+#[kretprobe]
+pub fn go_arm64_accept4_ret(ctx: RetProbeContext) -> u32 {
     if !is_target_process() {
         return 0;
     }
-    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
-        Ok(ret) => ret,
-        Err(_) => return 1,
+    let ret: i64 = match ctx.ret() {
+        Some(ret) => ret,
+        None => return 1,
     };
     if ret < 0 {
         return 0;
     }
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;
-    let fd = ret as u32;
-    match GO_SERVER_FDS.insert(&tcp_connection_key(pid, fd), &1, 0) {
+    match GO_SERVER_FDS.insert(&tcp_connection_key(pid, ret as u32), &1, 0) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-#[tracepoint]
-pub fn go_read_enter(ctx: TracePointContext) -> u32 {
-    match stash_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
+#[kprobe]
+pub fn go_arm64_read_enter(ctx: ProbeContext) -> u32 {
+    match stash_arm64_go_call(&ctx, &ACTIVE_GO_READ_CALLS) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-#[tracepoint]
-pub fn go_read_exit(ctx: TracePointContext) -> u32 {
-    let key = bpf_get_current_pid_tgid();
-    let args = unsafe { ACTIVE_GO_READ_CALLS.get(&key) };
-    let Some(args) = args else {
-        return 0;
-    };
-    let fd = args.fd;
-    let buf_ptr = args.buf_ptr;
-    let _ = ACTIVE_GO_READ_CALLS.remove(&key);
-    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
-        Ok(ret) => ret,
-        Err(_) => return 1,
-    };
-    if ret <= 0 {
-        return 0;
-    }
-    let pid = (key >> 32) as u32;
-    if !is_go_server_fd(pid, fd) {
-        return 0;
-    }
-    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 0) {
+#[kretprobe]
+pub fn go_arm64_read_ret(ctx: RetProbeContext) -> u32 {
+    match emit_arm64_go_call(&ctx, &ACTIVE_GO_READ_CALLS, 0) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-#[tracepoint]
-pub fn go_write_enter(ctx: TracePointContext) -> u32 {
-    match stash_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
+#[kprobe]
+pub fn go_arm64_write_enter(ctx: ProbeContext) -> u32 {
+    match stash_arm64_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS) {
         Ok(()) => 0,
         Err(_) => 1,
     }
 }
 
-#[tracepoint]
-pub fn go_write_exit(ctx: TracePointContext) -> u32 {
-    let key = bpf_get_current_pid_tgid();
-    let args = unsafe { ACTIVE_GO_WRITE_CALLS.get(&key) };
-    let Some(args) = args else {
-        return 0;
-    };
-    let fd = args.fd;
-    let buf_ptr = args.buf_ptr;
-    let _ = ACTIVE_GO_WRITE_CALLS.remove(&key);
-    let ret = match unsafe { ctx.read_at::<i64>(SYSCALL_RET_OFFSET) } {
-        Ok(ret) => ret,
-        Err(_) => return 1,
-    };
-    if ret <= 0 {
-        return 0;
-    }
-    let pid = (key >> 32) as u32;
-    if !is_go_server_fd(pid, fd) {
-        return 0;
-    }
-    match emit_go_tcp_events(fd, buf_ptr, ret as u32, 1) {
+#[kretprobe]
+pub fn go_arm64_write_ret(ctx: RetProbeContext) -> u32 {
+    match emit_arm64_go_call(&ctx, &ACTIVE_GO_WRITE_CALLS, 1) {
         Ok(()) => 0,
         Err(_) => 1,
     }
@@ -605,13 +584,13 @@ fn emit_tcp_close(fd: u32) -> Result<(), u32> {
     Ok(())
 }
 
-#[tracepoint]
-pub fn go_close_enter(ctx: TracePointContext) -> u32 {
+#[kprobe]
+pub fn go_arm64_close_enter(ctx: ProbeContext) -> u32 {
     if !is_target_process() {
         return 0;
     }
-    let fd = match unsafe { ctx.read_at::<u64>(SYSCALL_FD_OFFSET) } {
-        Ok(fd) => fd as u32,
+    let fd = match arm64_syscall_fd(&ctx) {
+        Ok(fd) => fd,
         Err(_) => return 1,
     };
     let pid = (bpf_get_current_pid_tgid() >> 32) as u32;

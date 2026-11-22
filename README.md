@@ -76,7 +76,7 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 
 - **Bun** — uses BoringSSL with stripped symbols; not matched by uprobes
 - **Deno** — uses rustls (pure Rust TLS); no `SSL_read`/`SSL_write` symbols
-- **Go agents over TLS** — `crypto/tls` is built into the Go runtime; no OpenSSL symbols. Plaintext HTTP/1.1 from a statically linked Go server is captured through its `read`/`write` syscall tracepoints when you select it with `--pid`/`--comm`
+- **Go agents over TLS** — `crypto/tls` is built into the Go runtime; no OpenSSL symbols. On ARM64, plaintext HTTP/1.1 from a statically linked Go server is captured through `__arm64_sys_read`/`__arm64_sys_write` syscall kprobes when selected with `--pid`/`--comm`.
 - **Rust with rustls** — pure Rust TLS; no standard symbol exports
 - **Java/Kotlin TLS** — uses JSSE, not OpenSSL (plain HTTP works via glibc)
 - **Electron apps** — BoringSSL via Chromium; same limitation as Bun (unless SSL symbols are exported, in which case it works)
@@ -109,7 +109,7 @@ Per call: model, input/output tokens, latency, time-to-first-token, stop reason,
 | `--archive-compression <zstd|lz4>` | Archive JSONL part codec (default: Zstd; DuckDB JSON S3 direct-read validated for `.zst`; LZ4 frame is explicit only) |
 | `--archive-retry-delay-secs <SECONDS>` | Base delay for failed archive retries (default: 5) |
 
-For a selected `--pid`/`--comm` target, agtap refuses to start if the Go direct-syscall tracepoint programs cannot load and attach. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.
+For a selected `--pid`/`--comm` target, agtap refuses to start if the ARM64 Go direct-syscall kprobes cannot load and attach. This prevents a static Go server from running with an apparent collector but no plaintext HTTP capture.
 
 One syscall is emitted as at most three fixed-size ring-buffer events of 512 KiB each, which covers the 1 MiB body cap plus the 64 KiB HTTP header allowance. The event ring buffer holds 16 MiB (~32 records).
 
