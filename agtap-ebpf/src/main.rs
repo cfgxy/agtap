@@ -259,6 +259,9 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // ── Plain HTTP capture via glibc send()/recv() uprobes ─────────────────
 
+// Preserve the size bound through the BPF call graph: older arm64 verifiers
+// do not propagate scalar ranges across BPF-to-BPF calls.
+#[inline(always)]
 fn emit_tcp_event_chunk(
     fd: u32,
     buf_ptr: u64,
@@ -329,6 +332,7 @@ fn emit_tcp_event(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(),
 const MAX_GO_SYSCALL_CHUNKS: u32 =
     (MAX_SYSCALL_CAPTURE_SIZE as u32 + MAX_EVENT_BYTES - 1) / MAX_EVENT_BYTES;
 
+#[inline(always)]
 fn emit_go_tcp_events(fd: u32, buf_ptr: u64, len: u32, direction: u32) -> Result<(), u32> {
     let configured_limit = GO_CAPTURE_MAX_BYTES.get(0).copied().unwrap_or(0);
     let mut remaining = if len > configured_limit {
