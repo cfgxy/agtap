@@ -261,6 +261,7 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // Keep this as a BPF subprogram: a local explicit mask is preserved by the
 // arm64 6.1 verifier, unlike a range proven in its callers.
+#[inline(never)]
 fn emit_tcp_event_chunk(
     fd: u32,
     buf_ptr: u64,
