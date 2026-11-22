@@ -444,6 +444,10 @@ fn is_go_server_fd(pid: u32, fd: u32) -> bool {
     unsafe { GO_SERVER_FDS.get(&tcp_connection_key(pid, fd)).is_some() }
 }
 
+// Tracepoint context pointers cannot be passed to BPF subprograms on all
+// kernels/architectures (notably arm64 6.1). Keep this helper inlined so the
+// verifier sees context reads directly in each tracepoint entry program.
+#[inline(always)]
 fn stash_go_call(ctx: &TracePointContext, calls: &HashMap<u64, TcpRecvArgs>) -> Result<(), u32> {
     if !is_target_process() {
         return Ok(());
@@ -456,6 +460,9 @@ fn stash_go_call(ctx: &TracePointContext, calls: &HashMap<u64, TcpRecvArgs>) -> 
         .map_err(|_| 1u32)
 }
 
+// See `stash_go_call`: inline context-consuming helpers for arm64 verifier
+// compatibility.
+#[inline(always)]
 fn emit_go_call(
     ctx: &TracePointContext,
     calls: &HashMap<u64, TcpRecvArgs>,
