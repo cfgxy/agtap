@@ -267,9 +267,14 @@ fn emit_tcp_event_chunk(
     filter_tls_record: bool,
     force_wakeup: bool,
 ) -> Result<(), u32> {
-    // `len` is always bounded to MAX_EVENT_DATA_SIZE by the caller, which keeps the
-    // ring-buffer reservation and verifier-visible slice bounded.
-    let safe_len = (len & EVENT_LEN_MASK) as usize;
+    // Clamp at the helper boundary rather than relying on caller bounds or a
+    // bitmask. arm64 Linux 6.1 does not preserve the former through inlining
+    // and rejects an unbounded `bpf_probe_read_user` size.
+    let safe_len = if len > MAX_EVENT_BYTES {
+        MAX_EVENT_BYTES
+    } else {
+        len
+    } as usize;
 
     // Only inspect the first chunk. Subsequent chunks may naturally start with
     // a TLS-record-looking byte even when the HTTP message is plaintext.
