@@ -259,9 +259,8 @@ fn emit_event(ssl_ptr: u64, buf_ptr: u64, len: u32, direction: u32) -> Result<()
 
 // ── Plain HTTP capture via glibc send()/recv() uprobes ─────────────────
 
-// Preserve the size bound through the BPF call graph: older arm64 verifiers
-// do not propagate scalar ranges across BPF-to-BPF calls.
-#[inline(always)]
+// Keep this as a BPF subprogram: a local explicit mask is preserved by the
+// arm64 6.1 verifier, unlike a range proven in its callers.
 fn emit_tcp_event_chunk(
     fd: u32,
     buf_ptr: u64,
@@ -270,14 +269,9 @@ fn emit_tcp_event_chunk(
     filter_tls_record: bool,
     force_wakeup: bool,
 ) -> Result<(), u32> {
-    // Keep an explicit bitmask at the immediate slice boundary: arm64 6.1
-    // verifier does not retain the branch-derived upper bound here.
-    let capped_len = if len > MAX_EVENT_BYTES {
-        MAX_EVENT_BYTES
-    } else {
-        len
-    };
-    let safe_len = (capped_len & EVENT_LEN_MASK) as usize;
+    // This mask is intentionally at the helper boundary; it gives the verifier
+    // the concrete array bound even when callers supply an unknown scalar.
+    let safe_len = (len & EVENT_LEN_MASK) as usize;
 
     // Only inspect the first chunk. Subsequent chunks may naturally start with
     // a TLS-record-looking byte even when the HTTP message is plaintext.
