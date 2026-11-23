@@ -70,6 +70,15 @@ pub struct ArchiveConfig {
     pub compression: ArchiveCompression,
 }
 
+/// The cleanup path may reclaim a body only for either of these successful,
+/// distinguishable outcomes. Any I/O or event-log parse error remains a
+/// protection failure and therefore retains the body for a later retry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CheckpointOutcome {
+    Checkpointed,
+    Orphaned,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ArchiveJob {
     id: String,
@@ -106,6 +115,18 @@ struct ArchiveJob {
     events_sha256: Option<String>,
     #[serde(default)]
     manifest_sha256: Option<String>,
+    /// Non-empty only for an active-log body checkpoint. These IDs are excluded from
+    /// the later rotation package, because the checkpoint owns their manifest.
+    #[serde(default)]
+    checkpoint_event_ids: Vec<String>,
+    /// Original body path and content digest retained in the checkpoint record.
+    #[serde(default)]
+    checkpoint_body_path: Option<String>,
+    #[serde(default)]
+    checkpoint_body_sha256: Option<String>,
+    /// Committed checkpoints excluded while preparing this normal rotation.
+    #[serde(default)]
+    consumed_checkpoint_event_ids: Vec<String>,
     attempts: u32,
     next_attempt_at: u64,
 }
@@ -130,6 +151,7 @@ pub struct ArchiveQueue {
     pending_dir: PathBuf,
     closed_dir: PathBuf,
     payload_dir: PathBuf,
+    committed_dir: PathBuf,
 }
 
 impl ArchiveQueue {
@@ -138,7 +160,11 @@ impl ArchiveQueue {
         let pending_dir = root.join("pending");
         let closed_dir = root.join("closed");
         let payload_dir = root.join("payloads");
-        for dir in [&pending_dir, &closed_dir, &payload_dir] {
+        // A committed checkpoint stays indexed until the active log is rotated.
+        // That prevents the later rotation package from re-emitting an event whose
+        // body was already archived through the pressure-path checkpoint.
+        let committed_dir = root.join("committed");
+        for dir in [&pending_dir, &closed_dir, &payload_dir, &committed_dir] {
             fs::create_dir_all(dir)?;
             #[cfg(unix)]
             {
@@ -151,6 +177,7 @@ impl ArchiveQueue {
             pending_dir,
             closed_dir,
             payload_dir,
+            committed_dir,
         })
     }
 
@@ -230,10 +257,171 @@ impl ArchiveQueue {
             bodies_sha256: None,
             events_sha256: None,
             manifest_sha256: None,
+            checkpoint_event_ids: Vec::new(),
+            checkpoint_body_path: None,
+            checkpoint_body_sha256: None,
+            consumed_checkpoint_event_ids: Vec::new(),
             attempts: 0,
             next_attempt_at: 0,
         };
         self.save_job(&job)
+    }
+
+    /// Persist a self-contained archive job for a body which is still referenced by
+    /// the active event log. This is deliberately called by the cleanup path, not
+    /// the capture or forwarding path: the network worker only sees it after the
+    /// local checkpoint has been atomically written and verified.
+    pub fn checkpoint_active_body(
+        &self,
+        active_log: &Path,
+        body_path: &Path,
+        object_prefix: &str,
+        compression: ArchiveCompression,
+    ) -> io::Result<CheckpointOutcome> {
+        if !body_path.is_file() {
+            return Ok(CheckpointOutcome::Orphaned);
+        }
+        let body = fs::read(body_path)?;
+        let body_sha256 = sha256_hex(&body);
+        let source = fs::read_to_string(active_log)?;
+        let original_path = body_path.to_string_lossy().into_owned();
+        let mut matching_lines = Vec::new();
+        for line in source.lines().filter(|line| !line.trim().is_empty()) {
+            let event: Value = serde_json::from_str(line).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("active event log is not valid JSON: {err}"),
+                )
+            })?;
+            if event.get("body_path").and_then(Value::as_str) == Some(original_path.as_str()) {
+                matching_lines.push((line.to_string(), event));
+            }
+        }
+        if matching_lines.is_empty() {
+            return Ok(CheckpointOutcome::Orphaned);
+        }
+
+        let mut seed = body.clone();
+        for (line, _) in &matching_lines {
+            seed.extend_from_slice(line.as_bytes());
+            seed.push(b'\n');
+        }
+        let id = format!("checkpoint-{}", sha256_hex(&seed));
+        if let Some(job) = self.load_job(&id) {
+            return self
+                .verify_checkpoint(&job)?
+                .then_some(CheckpointOutcome::Checkpointed)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "checkpoint record failed verification",
+                    )
+                });
+        }
+
+        let stable_body = self.closed_dir.join(format!("{id}.body.json"));
+        let snapshot = self.closed_dir.join(format!("{id}.jsonl"));
+        let mut event_ids = Vec::new();
+        let mut checkpoint_events = Vec::new();
+        for (_, mut event) in matching_lines {
+            let Some(event_id) = event.get("id").and_then(Value::as_str) else {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active event with a body_path has no stable id",
+                ));
+            };
+            if event_id.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "active event with a body_path has an empty stable id",
+                ));
+            }
+            event_ids.push(event_id.to_string());
+            event["body_path"] = Value::String(stable_body.to_string_lossy().into_owned());
+            append_jsonl(&mut checkpoint_events, &event)?;
+        }
+        event_ids.sort();
+        event_ids.dedup();
+        if event_ids.iter().all(|event_id| {
+            self.committed_dir
+                .join(format!("{}.json", checkpoint_marker_id(event_id)))
+                .is_file()
+        }) {
+            return Ok(CheckpointOutcome::Checkpointed);
+        }
+
+        write_atomic(&stable_body, &body)?;
+        write_atomic(&snapshot, &checkpoint_events)?;
+        if sha256_hex(&fs::read(&stable_body)?) != body_sha256
+            || fs::read(&snapshot)? != checkpoint_events
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "checkpoint payload verification failed",
+            ));
+        }
+
+        let job = ArchiveJob {
+            id: id.clone(),
+            rotation_id: None,
+            source_path: snapshot.to_string_lossy().into_owned(),
+            rotated_path: None,
+            // Protect the original until this verified record lets the cleanup
+            // caller remove it. `prepare` replaces this with the stable snapshot
+            // path before a worker can complete the job.
+            body_paths: vec![original_path.clone()],
+            object_prefix: object_prefix.trim_matches('/').to_string(),
+            compression,
+            partition_month: String::new(),
+            partition_day: String::new(),
+            bodies_key: String::new(),
+            events_key: String::new(),
+            manifest_key: String::new(),
+            bodies_payload_path: None,
+            events_payload_path: None,
+            manifest_payload_path: None,
+            bodies_sha256: None,
+            events_sha256: None,
+            manifest_sha256: None,
+            checkpoint_event_ids: event_ids,
+            checkpoint_body_path: Some(original_path),
+            checkpoint_body_sha256: Some(body_sha256),
+            consumed_checkpoint_event_ids: Vec::new(),
+            attempts: 0,
+            next_attempt_at: 0,
+        };
+        self.save_job(&job)?;
+        self.load_job(&id)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "checkpoint record disappeared"))
+            .and_then(|saved| {
+                self.verify_checkpoint(&saved)?
+                    .then_some(CheckpointOutcome::Checkpointed)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "checkpoint record failed verification",
+                        )
+                    })
+            })
+    }
+
+    fn verify_checkpoint(&self, job: &ArchiveJob) -> io::Result<bool> {
+        let (Some(original), Some(expected_sha)) = (
+            job.checkpoint_body_path.as_deref(),
+            job.checkpoint_body_sha256.as_deref(),
+        ) else {
+            return Ok(false);
+        };
+        if job.checkpoint_event_ids.is_empty() || !Path::new(&job.source_path).is_file() {
+            return Ok(false);
+        }
+        let paths = body_paths_from_log(Path::new(&job.source_path))?;
+        if paths.len() != 1 || sha256_hex(&fs::read(&paths[0])?) != expected_sha {
+            return Ok(false);
+        }
+        // The event IDs and original path are both part of the persisted record;
+        // the original is intentionally not dereferenced during verification.
+        Ok(!original.is_empty())
     }
 
     pub(crate) fn enqueue_rotation_with_compression(
@@ -393,12 +581,9 @@ impl ArchiveQueue {
 
     fn save_job(&self, job: &ArchiveJob) -> io::Result<()> {
         let path = self.pending_dir.join(format!("{}.json", job.id));
-        let temp = self.pending_dir.join(format!("{}.json.tmp", job.id));
         let bytes = serde_json::to_vec_pretty(job)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
-        fs::write(&temp, bytes)?;
-        fs::rename(temp, path)?;
-        Ok(())
+        write_atomic(&path, &bytes)
     }
 
     fn load_jobs(&self) -> Vec<ArchiveJob> {
@@ -417,6 +602,41 @@ impl ArchiveQueue {
 
     pub fn pending_count(&self) -> usize {
         self.load_jobs().len()
+    }
+
+    /// Counts only metadata; it never exposes body paths or payload contents.
+    pub fn checkpoint_backlog_count(&self) -> usize {
+        self.load_jobs()
+            .into_iter()
+            .filter(|job| !job.checkpoint_event_ids.is_empty())
+            .count()
+    }
+
+    fn checkpoint_event_ids(&self) -> HashSet<String> {
+        let mut ids = self
+            .load_jobs()
+            .into_iter()
+            .flat_map(|job| job.checkpoint_event_ids)
+            .collect::<HashSet<_>>();
+        if let Ok(entries) = fs::read_dir(&self.committed_dir) {
+            for entry in entries.flatten() {
+                if let Ok(bytes) = fs::read(entry.path()) {
+                    if let Some(event_id) =
+                        serde_json::from_slice::<Value>(&bytes)
+                            .ok()
+                            .and_then(|value| {
+                                value
+                                    .get("event_id")
+                                    .and_then(Value::as_str)
+                                    .map(str::to_owned)
+                            })
+                    {
+                        ids.insert(event_id);
+                    }
+                }
+            }
+        }
+        ids
     }
 
     fn load_job(&self, id: &str) -> Option<ArchiveJob> {
@@ -440,7 +660,25 @@ impl ArchiveQueue {
         );
     }
 
-    fn complete(&self, job: &ArchiveJob) {
+    /// Mark a job complete only after checkpoint de-duplication markers are durable.
+    /// Returning an error leaves all job inputs in place for the worker retry path.
+    fn complete(&self, job: &ArchiveJob) -> io::Result<()> {
+        for event_id in &job.checkpoint_event_ids {
+            let bytes = serde_json::to_vec(&serde_json::json!({"event_id": event_id}))
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            write_atomic(
+                &self
+                    .committed_dir
+                    .join(format!("{}.json", checkpoint_marker_id(event_id))),
+                &bytes,
+            )?;
+        }
+        for event_id in &job.consumed_checkpoint_event_ids {
+            let _ = fs::remove_file(
+                self.committed_dir
+                    .join(format!("{}.json", checkpoint_marker_id(event_id))),
+            );
+        }
         let protected = self.protected_body_paths(Some(&job.id));
         for body_path in &job.body_paths {
             let path = Path::new(body_path);
@@ -460,6 +698,7 @@ impl ArchiveQueue {
             let _ = fs::remove_file(payload_path);
         }
         let _ = fs::remove_file(self.pending_dir.join(format!("{}.json", job.id)));
+        Ok(())
     }
 
     /// Return body files referenced by queued jobs and unfinished rotation intents. The current
@@ -514,8 +753,13 @@ impl ArchiveQueue {
             return Ok(prepared);
         }
 
+        let excluded_checkpoint_ids = if job.checkpoint_event_ids.is_empty() {
+            self.checkpoint_event_ids()
+        } else {
+            HashSet::new()
+        };
         let (events_jsonl, bodies_jsonl, body_paths) =
-            tables_from_log(Path::new(&job.source_path))?;
+            tables_from_log(Path::new(&job.source_path), &excluded_checkpoint_ids)?;
         let bodies = job.compression.compress(&bodies_jsonl)?;
         let events = job.compression.compress(&events_jsonl)?;
         let bodies_digest = sha256_hex(&bodies);
@@ -546,6 +790,7 @@ impl ArchiveQueue {
         job.bodies_sha256 = Some(bodies_digest.clone());
         job.events_sha256 = Some(events_digest.clone());
         job.manifest_sha256 = Some(manifest_digest.clone());
+        job.consumed_checkpoint_event_ids = excluded_checkpoint_ids.into_iter().collect();
         self.save_job(&job)?;
 
         let bodies_key = job.bodies_key.clone();
@@ -786,7 +1031,9 @@ async fn process_job(
             .await
     };
     if uploaded.is_ok() {
-        queue.complete(&prepared.job);
+        if queue.complete(&prepared.job).is_err() {
+            queue.mark_retry(prepared.job, retry_delay_secs);
+        }
     } else {
         queue.mark_retry(prepared.job, retry_delay_secs);
     }
@@ -850,7 +1097,10 @@ fn load_object(
     }))
 }
 
-fn tables_from_log(path: &Path) -> io::Result<(Vec<u8>, Vec<u8>, Vec<String>)> {
+fn tables_from_log(
+    path: &Path,
+    excluded_event_ids: &HashSet<String>,
+) -> io::Result<(Vec<u8>, Vec<u8>, Vec<String>)> {
     let text = fs::read_to_string(path)?;
     let mut events = Vec::new();
     let mut bodies = Vec::new();
@@ -861,6 +1111,13 @@ fn tables_from_log(path: &Path) -> io::Result<(Vec<u8>, Vec<u8>, Vec<String>)> {
     for line in text.lines().filter(|line| !line.trim().is_empty()) {
         let mut event: Value = serde_json::from_str(line)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+        if event
+            .get("id")
+            .and_then(Value::as_str)
+            .is_some_and(|id| excluded_event_ids.contains(id))
+        {
+            continue;
+        }
         let body_id = if let Some(body_path) = event.get("body_path").and_then(Value::as_str) {
             let body_path = body_path.to_string();
             if let Some(id) = body_ids.get(&body_path) {
@@ -923,6 +1180,20 @@ fn body_paths_from_log(path: &Path) -> io::Result<Vec<String>> {
         }
     }
     Ok(paths)
+}
+
+fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let temp = path.with_extension("tmp");
+    {
+        let mut file = fs::File::create(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+    }
+    fs::rename(temp, path)
+}
+
+fn checkpoint_marker_id(event_id: &str) -> String {
+    sha256_hex(event_id.as_bytes())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1160,6 +1431,219 @@ mod tests {
         let job = reopened.load_jobs().pop().unwrap();
         assert_eq!(job.rotation_id.as_deref(), Some(rotation_id.as_str()));
         assert_eq!(job.compression, ArchiveCompression::Zstd);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_marker_write_failure_retains_job_until_retry() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(
+            &body,
+            br#"{"request_body":"fixture-request","response_body":"fixture-response"}"#,
+        )
+        .unwrap();
+        let active = dir.path().join("events.jsonl");
+        fs::write(
+            &active,
+            format!(
+                "{{\"id\":\"checkpoint-event\",\"body_path\":\"{}\"}}\n",
+                body.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&active, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        // The cleanup path may already have reclaimed this original after the
+        // checkpoint record was verified; the stable checkpoint body is distinct.
+        fs::remove_file(&body).unwrap();
+        let job = queue.load_jobs().pop().unwrap();
+        let stable_snapshot = PathBuf::from(&job.source_path);
+        let stable_body = body_paths_from_log(&stable_snapshot)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let committed = runtime.join("archive/committed");
+        fs::remove_dir(&committed).unwrap();
+        fs::write(&committed, b"failure injection").unwrap();
+        let uploader = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: None,
+        };
+        process_job(&queue, &uploader, job, 1).await;
+
+        let retained = queue.load_jobs().pop().unwrap();
+        assert!(stable_snapshot.exists());
+        assert!(Path::new(&stable_body).exists());
+        assert!(retained
+            .manifest_payload_path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).exists()));
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(retained.attempts, 1);
+
+        fs::remove_file(&committed).unwrap();
+        fs::create_dir(&committed).unwrap();
+        process_job(&queue, &uploader, retained, 1).await;
+        assert_eq!(queue.pending_count(), 0);
+        assert!(!stable_snapshot.exists());
+        assert!(!Path::new(&stable_body).exists());
+        assert!(committed.read_dir().unwrap().next().is_some());
+    }
+
+    #[tokio::test]
+    async fn active_log_checkpoint_survives_failure_restart_and_rotation() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(
+            &body,
+            br#"{"request_body":"fixture-request","response_body":"fixture-response"}"#,
+        )
+        .unwrap();
+        let sse_body = dir.path().join("sse-body.json");
+        fs::write(
+            &sse_body,
+            br#"{"request_body":"fixture-sse-request","response_body":"fixture-sse-response"}"#,
+        )
+        .unwrap();
+        let active = dir.path().join("events.jsonl");
+        fs::write(
+            &active,
+            format!(
+                "{{\"id\":\"plain\",\"streaming\":false,\"body_path\":\"{}\"}}\n{{\"id\":\"sse\",\"streaming\":true,\"body_path\":\"{}\"}}\n",
+                body.display(),
+                sse_body.display(),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&active, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        assert!(queue.protected_body_paths(None).contains(&body));
+        // This models cleanup after the verified local checkpoint, not a worker upload.
+        fs::remove_file(&body).unwrap();
+
+        let job = queue.load_jobs().pop().unwrap();
+        let failing = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: Some("agtap_manifests/"),
+        };
+        process_job(&queue, &failing, job, 1).await;
+        assert_eq!(queue.checkpoint_backlog_count(), 1);
+        drop(queue);
+
+        // Restart after payload preparation but before a verified manifest.
+        let reopened = ArchiveQueue::open(&runtime).unwrap();
+        let checkpoint = reopened
+            .load_jobs()
+            .into_iter()
+            .find(|job| !job.checkpoint_event_ids.is_empty())
+            .unwrap();
+        assert!(reopened.verify_checkpoint(&checkpoint).unwrap());
+        let succeeding = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: None,
+        };
+        process_job(&reopened, &succeeding, checkpoint, 1).await;
+        assert_eq!(reopened.checkpoint_backlog_count(), 0);
+
+        // A later normal rotation excludes the already committed event but keeps
+        // the SSE event, so there is exactly one stable event/body association.
+        let rotated = dir.path().join("events.jsonl.1");
+        fs::rename(&active, &rotated).unwrap();
+        reopened
+            .enqueue_rotated_with_compression(&rotated, "tenant", ArchiveCompression::Zstd)
+            .unwrap();
+        let rotation = reopened
+            .load_jobs()
+            .into_iter()
+            .find(|job| job.checkpoint_event_ids.is_empty())
+            .unwrap();
+        let prepared = reopened.prepare(rotation.clone()).unwrap();
+        let events = String::from_utf8(
+            ArchiveCompression::Zstd
+                .decompress(&prepared.events.bytes)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(events.lines().count(), 1);
+        assert!(events.contains("sse"));
+        assert!(!events.contains("plain"));
+        let bodies = String::from_utf8(
+            ArchiveCompression::Zstd
+                .decompress(&prepared.bodies.bytes)
+                .unwrap(),
+        )
+        .unwrap();
+        let event: Value = serde_json::from_str(events.lines().next().unwrap()).unwrap();
+        let archived_body: Value = serde_json::from_str(bodies.lines().next().unwrap()).unwrap();
+        assert_eq!(event["body_id"], archived_body["body_id"]);
+        assert_eq!(
+            archived_body["body_id"],
+            Value::String(sha256_hex(&fs::read(&sse_body).unwrap()))
+        );
+
+        process_job(&reopened, &succeeding, rotation, 1).await;
+        assert!(reopened.checkpoint_event_ids().is_empty());
+    }
+
+    #[test]
+    fn invalid_active_log_never_classifies_a_body_as_orphan() {
+        let dir = TempDir::new().unwrap();
+        let queue = ArchiveQueue::open(&dir.path().join("runtime")).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(&body, b"fixture").unwrap();
+        let log = dir.path().join("events.jsonl");
+        fs::write(&log, "not-json\n").unwrap();
+
+        assert!(queue
+            .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+            .is_err());
+        assert_eq!(queue.pending_count(), 0);
+        assert!(body.exists());
+    }
+
+    #[test]
+    fn checkpoint_is_idempotent_before_worker_runs() {
+        let dir = TempDir::new().unwrap();
+        let queue = ArchiveQueue::open(&dir.path().join("runtime")).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(
+            &body,
+            br#"{"request_body":"fixture","response_body":"fixture"}"#,
+        )
+        .unwrap();
+        let log = dir.path().join("events.jsonl");
+        fs::write(
+            &log,
+            format!("{{\"id\":\"e1\",\"body_path\":\"{}\"}}\n", body.display()),
+        )
+        .unwrap();
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&log, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        assert_eq!(queue.pending_count(), 1);
     }
 
     #[test]

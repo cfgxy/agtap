@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::time::Duration;
+use std::time::Instant;
 
 use crate::providers::HttpDetail;
 
@@ -14,13 +16,35 @@ const CLEANUP_TARGET_PERCENT: u64 = 80;
 pub struct BodyStore {
     dir: PathBuf,
     total_bytes: u64,
-    max_bytes: u64,
     retention_secs: u64,
+    high_water_bytes: u64,
+    hard_water_bytes: u64,
+    dropped_new_bodies: u64,
     last_cleanup: Instant,
 }
 
 impl BodyStore {
     pub fn open(dir: &Path, max_mb: u64, retention_hours: u64) -> io::Result<Self> {
+        Self::open_with_watermarks(dir, max_mb, retention_hours, 90, 100)
+    }
+
+    pub fn open_with_watermarks(
+        dir: &Path,
+        max_mb: u64,
+        retention_hours: u64,
+        high_water_percent: u8,
+        hard_water_percent: u8,
+    ) -> io::Result<Self> {
+        if high_water_percent == 0
+            || hard_water_percent == 0
+            || high_water_percent > hard_water_percent
+            || hard_water_percent > 100
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "body store watermarks must satisfy 0 < high <= hard <= 100",
+            ));
+        }
         fs::create_dir_all(dir)?;
         #[cfg(unix)]
         {
@@ -44,13 +68,48 @@ impl BodyStore {
         Ok(Self {
             dir: dir.to_path_buf(),
             total_bytes,
-            max_bytes: max_mb * 1024 * 1024,
             retention_secs: retention_hours * 3600,
+            high_water_bytes: max_mb * 1024 * 1024 * high_water_percent as u64 / 100,
+            hard_water_bytes: max_mb * 1024 * 1024 * hard_water_percent as u64 / 100,
+            dropped_new_bodies: 0,
             last_cleanup: Instant::now(),
         })
     }
 
     pub fn write(
+        &mut self,
+        pid: u32,
+        timestamp_ns: u64,
+        event_id: &str,
+        detail: &HttpDetail,
+    ) -> io::Result<PathBuf> {
+        self.write_inner(pid, timestamp_ns, event_id, detail)
+    }
+
+    /// Return `Ok(None)` at the configured hard water mark. The caller still
+    /// emits the event, so capture degradation never changes the forwarded call.
+    pub fn write_if_within_hard_water(
+        &mut self,
+        pid: u32,
+        timestamp_ns: u64,
+        event_id: &str,
+        detail: &HttpDetail,
+    ) -> io::Result<Option<PathBuf>> {
+        if self.total_bytes >= self.hard_water_bytes {
+            self.dropped_new_bodies = self.dropped_new_bodies.saturating_add(1);
+            log::warn!(
+                "body_store hard watermark reached; new body capture skipped (stored_bytes={}, hard_bytes={}, skipped={})",
+                self.total_bytes,
+                self.hard_water_bytes,
+                self.dropped_new_bodies
+            );
+            return Ok(None);
+        }
+        self.write_inner(pid, timestamp_ns, event_id, detail)
+            .map(Some)
+    }
+
+    fn write_inner(
         &mut self,
         pid: u32,
         timestamp_ns: u64,
@@ -88,8 +147,29 @@ impl BodyStore {
         serde_json::from_slice(&data).map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))
     }
 
+    pub fn is_over_high_water(&self) -> bool {
+        self.total_bytes >= self.high_water_bytes
+    }
+
+    pub fn dropped_new_bodies(&self) -> u64 {
+        self.dropped_new_bodies
+    }
+
     /// Delete old files and enforce size limit. Called periodically (every 10 min).
     pub fn cleanup_if_needed(&mut self, protected_paths: &HashSet<PathBuf>) {
+        self.cleanup_if_needed_with_checkpoint(protected_paths, |_| true);
+    }
+
+    /// A body becomes reclaimable only after the callback has either made a
+    /// durable, verified checkpoint or confirmed it has no active event reference.
+    /// Returning false protects the body for a later retry.
+    pub fn cleanup_if_needed_with_checkpoint<F>(
+        &mut self,
+        protected_paths: &HashSet<PathBuf>,
+        mut checkpoint: F,
+    ) where
+        F: FnMut(&Path) -> bool,
+    {
         if self.last_cleanup.elapsed().as_secs() < CLEANUP_INTERVAL_SECS {
             return;
         }
@@ -126,19 +206,21 @@ impl BodyStore {
             }
             let age = now.duration_since(modified).unwrap_or_default();
             if age.as_secs() > self.retention_secs {
-                if fs::remove_file(path).is_ok() {
+                let removed = checkpoint(path) && fs::remove_file(path).is_ok();
+                if removed {
                     self.total_bytes = self.total_bytes.saturating_sub(size);
                 }
-                false
+                !removed
             } else {
                 true
             }
         });
 
-        // Pass 2: if still over limit, delete oldest until under 80%
-        if self.total_bytes > self.max_bytes {
+        // Pass 2: begin pressure cleanup at the configurable high watermark,
+        // then leave headroom below it for incoming bodies and checkpoint work.
+        if self.total_bytes > self.high_water_bytes {
             files.sort_by_key(|&(_, _, modified)| modified);
-            let target = self.max_bytes * CLEANUP_TARGET_PERCENT / 100;
+            let target = self.high_water_bytes * CLEANUP_TARGET_PERCENT / 100;
             for (path, size, _) in &files {
                 if self.total_bytes <= target {
                     break;
@@ -146,7 +228,7 @@ impl BodyStore {
                 if protected_paths.contains(path) {
                     continue;
                 }
-                if fs::remove_file(path).is_ok() {
+                if checkpoint(path) && fs::remove_file(path).is_ok() {
                     self.total_bytes = self.total_bytes.saturating_sub(*size);
                 }
             }
@@ -182,6 +264,142 @@ mod tests {
         store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
         store.cleanup_if_needed(&HashSet::new());
         assert!(!body_path.exists());
+    }
+
+    #[test]
+    fn cleanup_requires_checkpoint_before_removal() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BodyStore::open(dir.path(), 0, 24).unwrap();
+        let path = dir.path().join("body.json");
+        fs::write(&path, b"body").unwrap();
+        store.total_bytes = 4;
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |_| false);
+        assert!(path.exists(), "an uncheckpointed body must be retained");
+
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |_| true);
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn archive_cleanup_reclaims_unreferenced_orphan_under_pressure() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let orphan = body_dir.join("orphan.json");
+        fs::write(&orphan, b"orphan").unwrap();
+        store.total_bytes = fs::metadata(&orphan).unwrap().len();
+        let active_log = dir.path().join("events.jsonl");
+        fs::write(&active_log, "{\"id\":\"other\"}\n").unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(!orphan.exists());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn archive_cleanup_reclaims_unreferenced_orphan_after_retention() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 1, 0).unwrap();
+        let orphan = body_dir.join("expired-orphan.json");
+        fs::write(&orphan, b"orphan").unwrap();
+        store.total_bytes = fs::metadata(&orphan).unwrap().len();
+        fs::File::open(&orphan)
+            .unwrap()
+            .set_times(
+                fs::FileTimes::new()
+                    .set_modified(std::time::SystemTime::now() - Duration::from_secs(1)),
+            )
+            .unwrap();
+        let active_log = dir.path().join("events.jsonl");
+        fs::write(&active_log, "{\"id\":\"other\"}\n").unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(!orphan.exists());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn archive_cleanup_retains_referenced_body_when_checkpoint_fails() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let body_dir = dir.path().join("bodies");
+        let queue = crate::archive::ArchiveQueue::open(&runtime).unwrap();
+        let mut store = BodyStore::open(&body_dir, 0, 24).unwrap();
+        let body = body_dir.join("referenced.json");
+        fs::write(&body, b"referenced").unwrap();
+        store.total_bytes = fs::metadata(&body).unwrap().len();
+        let active_log = dir.path().join("events.jsonl");
+        // The body is referenced, but the malformed event has no stable ID and
+        // therefore cannot be checkpointed safely.
+        fs::write(
+            &active_log,
+            format!("{{\"body_path\":\"{}\"}}\n", body.display()),
+        )
+        .unwrap();
+        store.last_cleanup = Instant::now() - Duration::from_secs(CLEANUP_INTERVAL_SECS + 1);
+
+        store.cleanup_if_needed_with_checkpoint(&HashSet::new(), |path| {
+            queue
+                .checkpoint_active_body(
+                    &active_log,
+                    path,
+                    "tests",
+                    crate::archive::ArchiveCompression::Zstd,
+                )
+                .is_ok()
+        });
+
+        assert!(body.exists());
+        assert_eq!(queue.pending_count(), 0);
+    }
+
+    #[test]
+    fn hard_watermark_skips_new_capture_without_error() {
+        let dir = TempDir::new().unwrap();
+        let mut store = BodyStore::open_with_watermarks(dir.path(), 1, 24, 80, 80).unwrap();
+        store.total_bytes = store.hard_water_bytes;
+        let detail = crate::providers::test_helpers::make_exchange(
+            "example.test",
+            "/v1/test",
+            b"request",
+            b"response",
+        );
+        let http_detail = crate::providers::build_http_detail(&detail, &detail.response.body);
+        assert!(store
+            .write_if_within_hard_water(1, 1, "event", &http_detail)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.dropped_new_bodies(), 1);
     }
 
     #[test]
