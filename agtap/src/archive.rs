@@ -660,16 +660,18 @@ impl ArchiveQueue {
         );
     }
 
-    fn complete(&self, job: &ArchiveJob) {
+    /// Mark a job complete only after checkpoint de-duplication markers are durable.
+    /// Returning an error leaves all job inputs in place for the worker retry path.
+    fn complete(&self, job: &ArchiveJob) -> io::Result<()> {
         for event_id in &job.checkpoint_event_ids {
-            if let Ok(bytes) = serde_json::to_vec(&serde_json::json!({"event_id": event_id})) {
-                let _ = write_atomic(
-                    &self
-                        .committed_dir
-                        .join(format!("{}.json", checkpoint_marker_id(event_id))),
-                    &bytes,
-                );
-            }
+            let bytes = serde_json::to_vec(&serde_json::json!({"event_id": event_id}))
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?;
+            write_atomic(
+                &self
+                    .committed_dir
+                    .join(format!("{}.json", checkpoint_marker_id(event_id))),
+                &bytes,
+            )?;
         }
         for event_id in &job.consumed_checkpoint_event_ids {
             let _ = fs::remove_file(
@@ -696,6 +698,7 @@ impl ArchiveQueue {
             let _ = fs::remove_file(payload_path);
         }
         let _ = fs::remove_file(self.pending_dir.join(format!("{}.json", job.id)));
+        Ok(())
     }
 
     /// Return body files referenced by queued jobs and unfinished rotation intents. The current
@@ -1028,7 +1031,9 @@ async fn process_job(
             .await
     };
     if uploaded.is_ok() {
-        queue.complete(&prepared.job);
+        if queue.complete(&prepared.job).is_err() {
+            queue.mark_retry(prepared.job, retry_delay_secs);
+        }
     } else {
         queue.mark_retry(prepared.job, retry_delay_secs);
     }
@@ -1426,6 +1431,70 @@ mod tests {
         let job = reopened.load_jobs().pop().unwrap();
         assert_eq!(job.rotation_id.as_deref(), Some(rotation_id.as_str()));
         assert_eq!(job.compression, ArchiveCompression::Zstd);
+    }
+
+    #[tokio::test]
+    async fn checkpoint_marker_write_failure_retains_job_until_retry() {
+        let dir = TempDir::new().unwrap();
+        let runtime = dir.path().join("runtime");
+        let queue = ArchiveQueue::open(&runtime).unwrap();
+        let body = dir.path().join("body.json");
+        fs::write(
+            &body,
+            br#"{"request_body":"fixture-request","response_body":"fixture-response"}"#,
+        )
+        .unwrap();
+        let active = dir.path().join("events.jsonl");
+        fs::write(
+            &active,
+            format!(
+                "{{\"id\":\"checkpoint-event\",\"body_path\":\"{}\"}}\n",
+                body.display()
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            queue
+                .checkpoint_active_body(&active, &body, "tenant", ArchiveCompression::Zstd)
+                .unwrap(),
+            CheckpointOutcome::Checkpointed
+        );
+        // The cleanup path may already have reclaimed this original after the
+        // checkpoint record was verified; the stable checkpoint body is distinct.
+        fs::remove_file(&body).unwrap();
+        let job = queue.load_jobs().pop().unwrap();
+        let stable_snapshot = PathBuf::from(&job.source_path);
+        let stable_body = body_paths_from_log(&stable_snapshot)
+            .unwrap()
+            .pop()
+            .unwrap();
+
+        let committed = runtime.join("archive/committed");
+        fs::remove_dir(&committed).unwrap();
+        fs::write(&committed, b"failure injection").unwrap();
+        let uploader = RecordingUploader {
+            keys: Mutex::new(Vec::new()),
+            fail_key: None,
+        };
+        process_job(&queue, &uploader, job, 1).await;
+
+        let retained = queue.load_jobs().pop().unwrap();
+        assert!(stable_snapshot.exists());
+        assert!(Path::new(&stable_body).exists());
+        assert!(retained
+            .manifest_payload_path
+            .as_ref()
+            .is_some_and(|path| Path::new(path).exists()));
+        assert_eq!(queue.pending_count(), 1);
+        assert_eq!(retained.attempts, 1);
+
+        fs::remove_file(&committed).unwrap();
+        fs::create_dir(&committed).unwrap();
+        process_job(&queue, &uploader, retained, 1).await;
+        assert_eq!(queue.pending_count(), 0);
+        assert!(!stable_snapshot.exists());
+        assert!(!Path::new(&stable_body).exists());
+        assert!(committed.read_dir().unwrap().next().is_some());
     }
 
     #[tokio::test]
